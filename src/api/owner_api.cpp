@@ -136,6 +136,37 @@ uint32_t owner_try_shutdown(void* opaque, yukilinker_c_error_detail* error) {
   return retired;
 }
 
+uint32_t owner_host_services_bind(void* opaque, const void* host_services) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  if (modules_has_holders()) return YUKILINKER_C_BUSY;
+  // A host callback or another thread may still be running with the current table, and a
+  // nested bind would invalidate the table the running callback was entered through.
+  if (host_services == nullptr) {
+    if (!sole_operation()) return YUKILINKER_C_BUSY;
+    publish_host_services(nullptr);
+    return YUKILINKER_C_OK;
+  }
+  const auto* services = static_cast<const yukilinker_c_host_services*>(host_services);
+  if (!validate_host_services(services)) return YUKILINKER_C_UNSUPPORTED;
+  if (!sole_operation()) return YUKILINKER_C_BUSY;
+  // The table belongs to the caller, so it is copied out before any host code runs.
+  yukilinker_c_host_services copied = *services;
+  copied.size = sizeof(yukilinker_c_host_services);
+  size_t requested = 0;
+  bool has_page_size = false;
+  if (!query_host_page_size(copied, &requested, &has_page_size)) return YUKILINKER_C_UNSUPPORTED;
+  auto* owner = static_cast<Runtime*>(opaque);
+  // The hook ran with the mutation lock released, so the owner may have retired meanwhile, and a
+  // nested bind must not invalidate the table the running callback was entered through.
+  if (!sole_operation()) return YUKILINKER_C_BUSY;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  if (!adopt_host_page_size(requested, has_page_size)) return YUKILINKER_C_UNSUPPORTED;
+  owner->host_services = copied;
+  publish_host_services(&owner->host_services);
+  return YUKILINKER_C_OK;
+}
+
 uint32_t owner_context_destroy(void* opaque, void* context) {
   OperationGuard operation;
   if (runtime_from(opaque) == nullptr) return 0;

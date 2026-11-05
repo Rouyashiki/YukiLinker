@@ -620,6 +620,18 @@ YUKILINKER_C_API uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* run
 YUKILINKER_C_API uint32_t yukilinker_c_try_shutdown(yukilinker_c_runtime* runtime,
                                                     yukilinker_c_error_detail* error);
 
+/* Null restores the Core-local defaults; refuses while a module or operation holds the host. */
+YUKILINKER_C_API uint32_t yukilinker_c_host_services_bind(
+    yukilinker_c_runtime* runtime, const yukilinker_c_host_services* services);
+
+/* Hard limits; handle_limit is 1..65536, fixed after first allocation; stub budget includes RX/RW
+ * pages. */
+YUKILINKER_C_API uint32_t yukilinker_c_set_limits(yukilinker_c_runtime* runtime,
+                                                  uint32_t handle_limit, uint64_t stub_bytes);
+
+YUKILINKER_C_API uint32_t yukilinker_c_query_stats(yukilinker_c_runtime* runtime,
+                                                   yukilinker_c_runtime_stats* output);
+
 /* Provider success transfers its fd to the runtime. Search path is copied; provider/user
  * remain valid until context destruction. Destruction refuses active references and seals
  * the scope once retirement starts. A failed retirement can be resumed. */
@@ -655,6 +667,12 @@ YUKILINKER_C_API yukilinker_c_lookup_result yukilinker_c_lookup(yukilinker_c_run
 YUKILINKER_C_API uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime,
                                              yukilinker_c_handle handle,
                                              yukilinker_c_handle_info* output);
+
+/* Includes retained/uncertain handles, even when an open never returned. count is total;
+ * BUFFER_TOO_SMALL writes a prefix. Unknown ownership prevents later opens/lookups/closes. */
+YUKILINKER_C_API uint32_t yukilinker_c_handles(yukilinker_c_runtime* runtime,
+                                               yukilinker_c_handle_info* output, size_t capacity,
+                                               size_t* count);
 
 /* A retained PRIVATE handle retries collection without releasing another reference.
  * SYSTEM success only releases its reference; it does not promise an unmap. Use

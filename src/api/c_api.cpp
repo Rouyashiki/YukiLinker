@@ -22,7 +22,10 @@ extern "C" uint32_t yukilinker_c_has_feature(uint32_t feature) {
          feature == YUKILINKER_C_FEATURE_HOST_SERVICES ||
          feature == YUKILINKER_C_FEATURE_GENERATION_HANDLES ||
          feature == YUKILINKER_C_FEATURE_TRUSTED_HANDOFF ||
-         feature == YUKILINKER_C_FEATURE_CONTROLLED_FORK;
+         feature == YUKILINKER_C_FEATURE_CONTROLLED_FORK ||
+         feature == YUKILINKER_C_FEATURE_HOST_BIND ||
+         feature == YUKILINKER_C_FEATURE_SYSTEM_BACKEND ||
+         feature == YUKILINKER_C_FEATURE_RESOURCE_LIMITS;
 }
 
 extern "C" yukilinker_c_runtime* yukilinker_c_runtime_create(
@@ -37,6 +40,21 @@ extern "C" uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* runtime) 
 extern "C" uint32_t yukilinker_c_try_shutdown(yukilinker_c_runtime* runtime,
                                               yukilinker_c_error_detail* error) {
   return module_try_shutdown(runtime, error);
+}
+
+extern "C" uint32_t yukilinker_c_host_services_bind(yukilinker_c_runtime* runtime,
+                                                    const yukilinker_c_host_services* services) {
+  return owner_host_services_bind(runtime, services);
+}
+
+extern "C" uint32_t yukilinker_c_set_limits(yukilinker_c_runtime* runtime, uint32_t handle_limit,
+                                            uint64_t stub_bytes) {
+  return module_set_limits(runtime, handle_limit, stub_bytes);
+}
+
+extern "C" uint32_t yukilinker_c_query_stats(yukilinker_c_runtime* runtime,
+                                             yukilinker_c_runtime_stats* output) {
+  return module_query_stats(runtime, output);
 }
 
 extern "C" yukilinker_c_context* yukilinker_c_context_create(
@@ -73,6 +91,12 @@ extern "C" yukilinker_c_lookup_result yukilinker_c_lookup(yukilinker_c_runtime* 
 extern "C" uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime, yukilinker_c_handle handle,
                                        yukilinker_c_handle_info* output) {
   return module_query(runtime, handle, output);
+}
+
+extern "C" uint32_t yukilinker_c_handles(yukilinker_c_runtime* runtime,
+                                         yukilinker_c_handle_info* output, size_t capacity,
+                                         size_t* count) {
+  return module_handles(runtime, output, capacity, count);
 }
 
 extern "C" yukilinker_c_close_result yukilinker_c_close(yukilinker_c_runtime* runtime,

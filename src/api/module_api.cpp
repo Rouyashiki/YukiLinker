@@ -212,6 +212,54 @@ uint32_t try_shutdown(void* opaque, yukilinker_c_error_detail* output) {
   return owner_try_shutdown(opaque, output);
 }
 
+uint32_t set_limits(void* opaque, uint32_t handles, uint64_t bytes) {
+  OperationGuard operation;
+  auto* runtime = owner(opaque);
+  if (!runtime) return YUKILINKER_C_STALE_TOKEN;
+  if (!handles || handles > 65536 || bytes > SIZE_MAX) return YUKILINKER_C_UNSUPPORTED;
+  auto* data = state(runtime);
+  if (!data) return YUKILINKER_C_NO_MEMORY;
+  if (data->slots && handles != data->limit) return YUKILINKER_C_BUSY;
+  if (!caller_stub_set_budget(static_cast<size_t>(bytes))) return YUKILINKER_C_BUSY;
+  data->limit = handles;
+  return YUKILINKER_C_OK;
+}
+
+uint32_t query_stats(void* opaque, yukilinker_c_runtime_stats* output) {
+  OperationGuard operation;
+  if (!opaque || opaque != g_runtime_owner) return YUKILINKER_C_STALE_TOKEN;
+  if (!output) return YUKILINKER_C_INVALID_HANDLE;
+  *output = {};
+  output->size = sizeof(*output);
+  output->handle_limit = YUKILINKER_C_DEFAULT_HANDLE_LIMIT;
+  if (auto* data = g_runtime_owner->modules) {
+    output->handle_limit = data->limit;
+    output->handle_bytes = sizeof(ModuleState) + (data->slots ? data->limit * sizeof(Slot) : 0);
+    if (data->slots)
+      for (size_t i = 0; i < data->limit; ++i) {
+        const auto& slot = data->slots[i];
+        output->handles += slot.generation != 0;
+        output->uncertain_handles += slot.generation && slot.state == YUKILINKER_C_HANDLE_UNCERTAIN;
+        output->pending_operations += slot.pending;
+      }
+  }
+  size_t pages = 0, bytes = 0, used = 0, capacity = 0;
+  caller_stub_stats(&pages, &bytes);
+  caller_stub_slots(&used, &capacity);
+  output->stub_budget_bytes = caller_stub_budget();
+  output->stub_mapped_bytes = bytes;
+  output->stub_used_slots = used;
+  output->stub_capacity = capacity;
+  const auto loader = loader_query_stats();
+  output->images = loader.images;
+  output->mapped_bytes = loader.mapped_bytes;
+  output->arena_bytes = loader.arena_bytes;
+  output->peak_arena_bytes = loader.peak_arena_bytes;
+  output->tls_blocks = loader.tls_blocks;
+  output->thread_destructors = loader.thread_destructors;
+  return YUKILINKER_C_OK;
+}
+
 bool valid_options(const yukilinker_c_open_options* options) {
   if (!options || options->size != sizeof(*options) ||
       options->namespace_scope && options->context || options->file_backed > 1 ||
@@ -225,7 +273,9 @@ bool valid_options(const yukilinker_c_open_options* options) {
     return false;
 #endif
   if (options->backend == YUKILINKER_C_BACKEND_PRIVATE) return true;
-  return false;
+  return options->backend == YUKILINKER_C_BACKEND_SYSTEM && !options->context &&
+         !options->file_backed && !options->force_load && !options->trusted_runtime &&
+         !options->namespace_scope;
 }
 
 yukilinker_c_handle open(void* opaque, const char* path, int fd, bool from_fd,
@@ -297,6 +347,23 @@ yukilinker_c_handle open(void* opaque, const char* path, int fd, bool from_fd,
       auto* image = state_of(static_cast<SoHandle*>(raw));
       slot->image = {image->generation, image->namespace_id};
     }
+  } else {
+    const yukilinker_c_host_services services = host_services();
+    android_dlextinfo ext{};
+    ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+    ext.library_fd = fd;
+    yukilinker_c_host_dlopen_request request{};
+    request.size = sizeof(request);
+    request.flags = static_cast<int>(options->flags);
+    request.name = from_fd ? (options->origin ? options->origin : "[yukilinker-system-fd]") : path;
+    request.extension = from_fd ? &ext : nullptr;
+    CallbackGuard callback(nullptr);
+    (void)services.system_dlerror(services.user);
+    result.execution = YUKILINKER_C_EXECUTION_UNKNOWN;
+    raw = services.system_dlopen(services.user, &request);
+    if (!raw)
+      system_error(services, &result, YUKILINKER_C_IO_ERROR, YUKILINKER_C_INITIALIZATION,
+                   "host system_dlopen failed without an error string");
   }
   pending.finish();
   if (pending.host_entered) result.execution = YUKILINKER_C_EXECUTION_UNKNOWN;
@@ -370,6 +437,22 @@ uint32_t query(void* opaque, yukilinker_c_handle handle, yukilinker_c_handle_inf
   if (!slot || !output) return YUKILINKER_C_INVALID_HANDLE;
   info(*slot, output);
   return YUKILINKER_C_OK;
+}
+
+uint32_t handles(void* opaque, yukilinker_c_handle_info* output, size_t capacity, size_t* count) {
+  OperationGuard operation;
+  auto* runtime = owner(opaque);
+  if (!runtime) return YUKILINKER_C_STALE_TOKEN;
+  if (!count || (capacity && !output)) return YUKILINKER_C_INVALID_HANDLE;
+  *count = 0;
+  if (auto* data = runtime->modules; data && data->slots)
+    for (size_t i = 0; i < data->limit; ++i) {
+      auto& slot = data->slots[i];
+      if (!slot.generation) continue;
+      if (*count < capacity) info(slot, &output[*count]);
+      ++*count;
+    }
+  return *count <= capacity ? YUKILINKER_C_OK : YUKILINKER_C_BUFFER_TOO_SMALL;
 }
 
 yukilinker_c_close_result close(void* opaque, yukilinker_c_handle handle) {
@@ -533,6 +616,12 @@ uint32_t module_runtime_destroy(void* opaque) { return runtime_destroy(opaque); 
 uint32_t module_try_shutdown(void* opaque, yukilinker_c_error_detail* output) {
   return try_shutdown(opaque, output);
 }
+uint32_t module_set_limits(void* opaque, uint32_t handles, uint64_t bytes) {
+  return set_limits(opaque, handles, bytes);
+}
+uint32_t module_query_stats(void* opaque, yukilinker_c_runtime_stats* output) {
+  return query_stats(opaque, output);
+}
 void* module_context_create(void* opaque, const char* path,
                             yukilinker_c_dependency_provider provider, void* user) {
   return context_create(opaque, path, provider, user);
@@ -552,6 +641,10 @@ yukilinker_c_lookup_result module_lookup(void* opaque, yukilinker_c_handle handl
 }
 uint32_t module_query(void* opaque, yukilinker_c_handle handle, yukilinker_c_handle_info* output) {
   return query(opaque, handle, output);
+}
+uint32_t module_handles(void* opaque, yukilinker_c_handle_info* output, size_t capacity,
+                        size_t* count) {
+  return handles(opaque, output, capacity, count);
 }
 yukilinker_c_close_result module_close(void* opaque, yukilinker_c_handle handle) {
   return close(opaque, handle);

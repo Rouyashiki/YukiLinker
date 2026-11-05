@@ -25,12 +25,14 @@ __attribute__((visibility("default"))) int yukilinker_test_run(const char* direc
   yukilinker_c_host_services services = test_host_services();
   yukilinker_c_runtime* runtime = yukilinker_c_runtime_create(&services);
   assert(runtime && !yukilinker_c_runtime_create(&services));
+  assert(yukilinker_c_host_services_bind(runtime, NULL) == YUKILINKER_C_OK);
+  assert(yukilinker_c_host_services_bind(runtime, &services) == YUKILINKER_C_OK);
   char path[4096];
   snprintf(path, sizeof(path), "%s/liblinker_module.so", directory);
   yukilinker_c_open_options options = {0};
   options.size = sizeof(options);
   options.flags = RTLD_NOW;
-  for (uint32_t backend = YUKILINKER_C_BACKEND_PRIVATE; backend <= YUKILINKER_C_BACKEND_PRIVATE;
+  for (uint32_t backend = YUKILINKER_C_BACKEND_PRIVATE; backend <= YUKILINKER_C_BACKEND_SYSTEM;
        ++backend) {
     options.backend = backend;
     yukilinker_c_error error = {0};
