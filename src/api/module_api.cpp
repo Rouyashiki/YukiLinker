@@ -197,6 +197,21 @@ uint32_t runtime_destroy(void* opaque) {
   return owner_runtime_destroy(opaque);
 }
 
+uint32_t try_shutdown(void* opaque, yukilinker_c_error_detail* output) {
+  {
+    OperationGuard operation;
+    if (opaque == g_runtime_owner && opaque && !can_retire_modules()) {
+      if (output) {
+        *output = {};
+        output->code = YUKILINKER_C_BUSY;
+        output->stage = YUKILINKER_C_RETIREMENT;
+      }
+      return 0;
+    }
+  }
+  return owner_try_shutdown(opaque, output);
+}
+
 bool valid_options(const yukilinker_c_open_options* options) {
   if (!options || options->size != sizeof(*options) ||
       options->namespace_scope && options->context || options->file_backed > 1 ||
@@ -435,6 +450,20 @@ yukilinker_c_close_result close(void* opaque, yukilinker_c_handle handle) {
   return result;
 }
 
+uint32_t forget(void* opaque, yukilinker_c_handle handle) {
+  OperationGuard operation;
+  auto* runtime = owner(opaque);
+  if (!runtime) return YUKILINKER_C_STALE_TOKEN;
+  auto* slot = find(runtime, handle);
+  if (!slot) return YUKILINKER_C_INVALID_HANDLE;
+  if (slot->backend != YUKILINKER_C_BACKEND_PRIVATE ||
+      slot->reference != YUKILINKER_C_REFERENCE_RELEASED || slot->pending ||
+      slot->state == YUKILINKER_C_HANDLE_UNCERTAIN)
+    return YUKILINKER_C_BUSY;
+  *slot = {};
+  return YUKILINKER_C_OK;
+}
+
 void abandon(Pending* pending, uint32_t reason) {
   pending->slot->state = YUKILINKER_C_HANDLE_UNCERTAIN;
   pending->slot->reference = YUKILINKER_C_REFERENCE_UNKNOWN;
@@ -501,6 +530,9 @@ void* module_runtime_create(const yukilinker_c_host_services* services) {
   return runtime_create(services);
 }
 uint32_t module_runtime_destroy(void* opaque) { return runtime_destroy(opaque); }
+uint32_t module_try_shutdown(void* opaque, yukilinker_c_error_detail* output) {
+  return try_shutdown(opaque, output);
+}
 void* module_context_create(void* opaque, const char* path,
                             yukilinker_c_dependency_provider provider, void* user) {
   return context_create(opaque, path, provider, user);
@@ -524,4 +556,35 @@ uint32_t module_query(void* opaque, yukilinker_c_handle handle, yukilinker_c_han
 yukilinker_c_close_result module_close(void* opaque, yukilinker_c_handle handle) {
   return close(opaque, handle);
 }
+uint32_t module_forget(void* opaque, yukilinker_c_handle handle) { return forget(opaque, handle); }
+uint32_t module_release_host(void* opaque, yukilinker_c_handle handle) {
+  OperationGuard operation;
+  auto* runtime = owner(opaque);
+  if (!runtime) return YUKILINKER_C_STALE_TOKEN;
+  auto* slot = find(runtime, handle);
+  if (!slot) return YUKILINKER_C_INVALID_HANDLE;
+  if (slot->backend != YUKILINKER_C_BACKEND_PRIVATE) return YUKILINKER_C_UNSUPPORTED;
+  if (slot->pending || slot->reference != YUKILINKER_C_REFERENCE_OWNED ||
+      system_uncertain(runtime->modules))
+    return YUKILINKER_C_BUSY;
+  // Dependency close callbacks may reenter this handle or end their thread. Keep
+  // the same pending-operation guard used by open/lookup/close until handoff ends.
+  Pending pending(runtime->modules, slot);
+  const bool released = loader_release_host(slot->raw) != 0;
+  pending.finish();
+  if (!released) return YUKILINKER_C_BUSY;
+  *slot = {};
+  return YUKILINKER_C_OK;
+}
+
+uint32_t module_image(void* opaque, yukilinker_c_handle handle, yukilinker_c_image_record* output) {
+  OperationGuard operation;
+  auto* runtime = owner(opaque);
+  if (!runtime) return YUKILINKER_C_STALE_TOKEN;
+  auto* slot = find(runtime, handle);
+  if (!slot) return YUKILINKER_C_INVALID_HANDLE;
+  if (slot->backend != YUKILINKER_C_BACKEND_PRIVATE) return YUKILINKER_C_UNSUPPORTED;
+  return registry_image_query(slot->image, output);
+}
+
 }  // namespace yukilinker::internal

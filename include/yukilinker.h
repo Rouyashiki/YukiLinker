@@ -614,6 +614,12 @@ YUKILINKER_C_API yukilinker_c_runtime* yukilinker_c_runtime_create(
  * Stop all calls/TLS/callback users before destruction or unmapping the containing Core. */
 YUKILINKER_C_API uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* runtime);
 
+/* Returns 1 on shutdown, 0 otherwise. A 1 with cleanup_incomplete reports a leaked
+ * system dependency reference; proceed with runtime_destroy. A refused shutdown changes
+ * nothing; after the retirement boundary, RETRY/IO_ERROR resumes without repeating code. */
+YUKILINKER_C_API uint32_t yukilinker_c_try_shutdown(yukilinker_c_runtime* runtime,
+                                                    yukilinker_c_error_detail* error);
+
 /* Provider success transfers its fd to the runtime. Search path is copied; provider/user
  * remain valid until context destruction. Destruction refuses active references and seals
  * the scope once retirement starts. A failed retirement can be resumed. */
@@ -655,6 +661,30 @@ YUKILINKER_C_API uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime,
  * handle_valid, reference, retention reasons and error together; a failure may retain ownership. */
 YUKILINKER_C_API yukilinker_c_close_result yukilinker_c_close(yukilinker_c_runtime* runtime,
                                                               yukilinker_c_handle handle);
+
+/* Only forgets PRIVATE wrapper metadata after its reference was released; no unmap claim. */
+YUKILINKER_C_API uint32_t yukilinker_c_forget(yukilinker_c_runtime* runtime,
+                                              yukilinker_c_handle handle);
+
+/* Error code: OK transfers a Ready trusted image mapping to the caller and invalidates
+ * the handle, leaving the mapping intact. Refuses while used/pinned/referenced elsewhere.
+ * Dependencies are closed by this operation; bootstrap uses its separate dependency-transfer
+ * protocol. The receiving host must ultimately retire the mapping and all its callbacks. */
+YUKILINKER_C_API uint32_t yukilinker_c_release_host(yukilinker_c_runtime* runtime,
+                                                    yukilinker_c_handle handle);
+
+/* PRIVATE image record; SYSTEM reports UNSUPPORTED. No raw Bionic/private handle escapes. */
+YUKILINKER_C_API uint32_t yukilinker_c_handle_image(yukilinker_c_runtime* runtime,
+                                                    yukilinker_c_handle handle,
+                                                    yukilinker_c_image_record* output);
+
+/* Controlled fork brackets; nest only on the same thread and pair with after_fork.
+ * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
+YUKILINKER_C_API void yukilinker_c_prepare_fork(yukilinker_c_runtime* runtime);
+
+/* Controlled fork brackets; nest only on the same thread and pair with after_fork.
+ * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
+YUKILINKER_C_API void yukilinker_c_after_fork(yukilinker_c_runtime* runtime, int child);
 
 #ifdef __cplusplus
 }

@@ -21,6 +21,14 @@ Runtime* runtime_from(void* opaque) {
   return runtime != nullptr && runtime->active ? runtime : nullptr;
 }
 
+// A stale owner overwrites the caller's error record instead of leaving old contents behind.
+void report_stale(yukilinker_c_error_detail* error, uint32_t stage) {
+  if (error == nullptr) return;
+  *error = {};
+  error->code = YUKILINKER_C_STALE_TOKEN;
+  error->stage = stage;
+}
+
 // Shared by try_shutdown and runtime_destroy. On success the default host table is back in
 // place and the owner admits nothing but runtime_destroy. The owner goes inactive at the
 // shutdown's boundary (begin_shutdown), not before: a refusal leaves it as it was.
@@ -98,6 +106,34 @@ uint32_t owner_runtime_destroy(void* opaque) {
   const uint32_t destroyed = destroy_owner(opaque);
   if (destroyed) retire_fork_handlers();
   return destroyed;
+}
+
+uint32_t shut_down_owner(void* opaque, yukilinker_c_error_detail* error) {
+  OperationGuard operation;
+  // A retired owner outranks the busy check: after shutdown it is stale from any depth. One past
+  // the boundary, inactive, is still accepted here: this call resumes its shutdown.
+  auto* owner = owner_from(opaque);
+  if (owner == nullptr || owner->shut_down) {
+    report_stale(error, YUKILINKER_C_RETIREMENT);
+    return 0;
+  }
+  // Refused for the same reason as runtime_destroy: BUSY before the boundary (nothing changed),
+  // RETRY past it (the shutdown has begun and the next call resumes).
+  if (!sole_holder()) {
+    if (error) {
+      *error = {};
+      error->code = shutdown_begun() ? YUKILINKER_C_RETRY : YUKILINKER_C_BUSY;
+      error->stage = YUKILINKER_C_RETIREMENT;
+    }
+    return 0;
+  }
+  return retire_runtime(owner, error) ? 1 : 0;
+}
+
+uint32_t owner_try_shutdown(void* opaque, yukilinker_c_error_detail* error) {
+  const uint32_t retired = shut_down_owner(opaque, error);
+  if (retired) retire_fork_handlers();
+  return retired;
 }
 
 uint32_t owner_context_destroy(void* opaque, void* context) {

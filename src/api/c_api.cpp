@@ -20,7 +20,9 @@ extern "C" uint32_t yukilinker_c_has_feature(uint32_t feature) {
          feature == YUKILINKER_C_FEATURE_DLEXT_RELRO_ROOT ||
          feature == YUKILINKER_C_FEATURE_RUNTIME_OWNER ||
          feature == YUKILINKER_C_FEATURE_HOST_SERVICES ||
-         feature == YUKILINKER_C_FEATURE_GENERATION_HANDLES;
+         feature == YUKILINKER_C_FEATURE_GENERATION_HANDLES ||
+         feature == YUKILINKER_C_FEATURE_TRUSTED_HANDOFF ||
+         feature == YUKILINKER_C_FEATURE_CONTROLLED_FORK;
 }
 
 extern "C" yukilinker_c_runtime* yukilinker_c_runtime_create(
@@ -30,6 +32,11 @@ extern "C" yukilinker_c_runtime* yukilinker_c_runtime_create(
 
 extern "C" uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* runtime) {
   return module_runtime_destroy(runtime);
+}
+
+extern "C" uint32_t yukilinker_c_try_shutdown(yukilinker_c_runtime* runtime,
+                                              yukilinker_c_error_detail* error) {
+  return module_try_shutdown(runtime, error);
 }
 
 extern "C" yukilinker_c_context* yukilinker_c_context_create(
@@ -71,4 +78,31 @@ extern "C" uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime, yukilinker
 extern "C" yukilinker_c_close_result yukilinker_c_close(yukilinker_c_runtime* runtime,
                                                         yukilinker_c_handle handle) {
   return module_close(runtime, handle);
+}
+
+extern "C" uint32_t yukilinker_c_forget(yukilinker_c_runtime* runtime, yukilinker_c_handle handle) {
+  return module_forget(runtime, handle);
+}
+
+extern "C" uint32_t yukilinker_c_release_host(yukilinker_c_runtime* runtime,
+                                              yukilinker_c_handle handle) {
+  return module_release_host(runtime, handle);
+}
+
+extern "C" uint32_t yukilinker_c_handle_image(yukilinker_c_runtime* runtime,
+                                              yukilinker_c_handle handle,
+                                              yukilinker_c_image_record* output) {
+  return module_image(runtime, handle, output);
+}
+
+extern "C" void yukilinker_c_prepare_fork(yukilinker_c_runtime* runtime) {
+  if (runtime && runtime == reinterpret_cast<yukilinker_c_runtime*>(
+                                __atomic_load_n(&g_runtime_owner, __ATOMIC_ACQUIRE)))
+    loader_prepare_fork();
+}
+
+extern "C" void yukilinker_c_after_fork(yukilinker_c_runtime* runtime, int child) {
+  if (runtime && runtime == reinterpret_cast<yukilinker_c_runtime*>(
+                                __atomic_load_n(&g_runtime_owner, __ATOMIC_ACQUIRE)))
+    loader_after_fork(child);
 }
