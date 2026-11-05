@@ -32,7 +32,7 @@ target_include_directories(yukilinker_headers INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
-# ELF loading pipeline.
+# Shared by the runtime and the reduced bootstrap loader.
 set(YUKILINKER_LOADER_SOURCES
   src/api/loader_api.cpp
   src/dependency/dependencies.cpp
@@ -92,3 +92,33 @@ target_link_libraries(yukilinker_runtime PUBLIC YukiLinker::headers PRIVATE dl)
 target_compile_definitions(yukilinker_runtime PRIVATE ${YUKILINKER_RUNTIME_DEFINITIONS})
 target_compile_options(yukilinker_runtime PRIVATE ${YUKILINKER_RUNTIME_OPTIONS})
 target_link_options(yukilinker_runtime INTERFACE ${YUKILINKER_RUNTIME_LINK_OPTIONS})
+
+# Functions called from a consumer directory must not depend on that directory's variables.
+foreach(setting SOURCES DEFINITIONS OPTIONS LINK_OPTIONS)
+  set_property(GLOBAL PROPERTY YUKILINKER_RUNTIME_${setting} "${YUKILINKER_RUNTIME_${setting}}")
+endforeach()
+include(${CMAKE_CURRENT_LIST_DIR}/YukiLinkerRuntimeSources.cmake)
+
+if(YUKILINKER_BUILD_BOOTSTRAP)
+  add_library(yukilinker_bootstrap SHARED
+    src/bootstrap/bootstrap_loader.cpp src/bootstrap/legacy_packet.cpp
+    ${YUKILINKER_LOADER_SOURCES})
+  add_library(YukiLinker::bootstrap ALIAS yukilinker_bootstrap)
+  set_target_properties(yukilinker_bootstrap PROPERTIES
+    OUTPUT_NAME "yloader${YUKILINKER_ABI_SUFFIX}"
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+  target_link_libraries(yukilinker_bootstrap PUBLIC YukiLinker::headers PRIVATE dl)
+  target_compile_definitions(yukilinker_bootstrap PRIVATE YUKILINKER_FULL=0 YUKILINKER_BOOTSTRAP=1)
+  target_compile_options(yukilinker_bootstrap PRIVATE
+    -fPIC -Os -g -fno-exceptions -fno-rtti -fno-stack-protector -fno-c++-static-destructors
+    -ffunction-sections -fdata-sections -fvisibility=hidden ${YUKILINKER_BRANCH_PROTECTION})
+  target_link_options(yukilinker_bootstrap PRIVATE -nostdlib++ -Wl,--gc-sections -Wl,--as-needed
+    -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap/exports.map")
+  set_property(TARGET yukilinker_bootstrap APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap/exports.map)
+  if(YUKILINKER_SANITIZER)
+    target_compile_options(yukilinker_bootstrap PRIVATE -fsanitize=${YUKILINKER_SANITIZER} -fno-omit-frame-pointer)
+    target_link_options(yukilinker_bootstrap PRIVATE -fsanitize=${YUKILINKER_SANITIZER})
+  endif()
+endif()

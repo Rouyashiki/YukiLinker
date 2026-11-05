@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+option(YUKILINKER_BUILD_BOOTSTRAP "Build the Core bootstrap loader" ON)
 option(YUKILINKER_CFI "Instrument the Core runtime with cross-DSO CFI" OFF)
 set(YUKILINKER_SANITIZER "" CACHE STRING "Optional NDK sanitizer")
 set(YUKILINKER_SUPPORTED_ABIS arm64-v8a armeabi-v7a)

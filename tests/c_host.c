@@ -17,6 +17,9 @@
 
 _Static_assert(sizeof(yukilinker_c_handle) == 16, "module handle layout");
 _Static_assert(offsetof(yukilinker_c_handle, generation) == 8, "handle generation offset");
+_Static_assert(sizeof(yukilinker_c_early_packet_header) == 24, "packet header layout");
+_Static_assert(sizeof(yukilinker_c_early_packet_entry) == 844, "packet entry layout");
+_Static_assert(YUKILINKER_C_EARLY_PACKET_VERSION == 3, "packet wire version");
 
 __attribute__((visibility("default"))) int yukilinker_test_run(const char* directory) {
   assert(yukilinker_c_abi_version() == 1);

@@ -569,6 +569,83 @@ typedef struct yukilinker_c_runtime_stats {
 
 #define YUKILINKER_C_DEFAULT_HANDLE_LIMIT 1024U
 
+/* Stage-one ABI, compatible with YukiZygisk's original Core handoff.
+ * The caller system-loads libyloaderXX.so and transfers its initial dlopen
+ * reference on a successful Core adoption. Do not link the Core against this
+ * library. It must contain its own runtime (archive or source integration).
+ *
+ * A call admitted by the single-flight guard consumes core_fd. Before entry,
+ * the loader owns the early packet and its descriptors; at zygisk_core_entry
+ * that ownership passes to the Core. Invalid/busy calls leave inputs untouched.
+ * Success tail-calls the Core finalizer, which dlcloses the transferred loader
+ * reference. No return address may remain in the loader. Failure sets errno;
+ * a call that ran Core code or could not clean up retains its mapping/state.
+ * Reentry and a fork inheriting unfinished work are refused (EBUSY).
+ */
+void yuki_bootstrap(int core_fd, int early_packet_fd_plus1);
+#if defined(__arm__)
+void yuki_bootstrap_tango(uint32_t got, uint32_t original, uint32_t stub, int core_fd,
+                          int early_packet_fd_plus1);
+#endif
+#define YUKILINKER_C_TANGO_BOOTSTRAP_SIZE 224U
+
+/* Required Core exports. The name is borrowed for the entry call; the Core
+ * copies any data it retains. loader_anchor identifies the stage-one mapping.
+ * The Core must prove that all persistent code/data/TLS/callback references
+ * survive loader unload before handoff_ready returns true. Dependencies are
+ * the exact dlopen references stage one acquired; take_dependencies copies
+ * the list and takes all references only on true. finish_handoff commits once.
+ * finalizers run in the Core, outside stage one's stack, and release the
+ * adopted loader reference with system dlclose. They must not call it again.
+ */
+typedef void (*yukilinker_c_core_entry)(const char*, void*, void*, void*, int);
+typedef bool (*yukilinker_c_core_adopt)(uintptr_t, size_t, void*);
+typedef bool (*yukilinker_c_core_ready)(void);
+typedef bool (*yukilinker_c_core_take_dependencies)(void* const*, size_t);
+typedef bool (*yukilinker_c_core_finish_handoff)(bool);
+typedef void (*yukilinker_c_core_finalize)(int, int);
+typedef bool (*yukilinker_c_core_set_tango)(uint32_t, uint32_t);
+typedef void (*yukilinker_c_core_finalize_tango)(uint32_t, uint32_t, uint32_t, int, int);
+
+/* Implement these in the Core. They are the only public handoff symbols;
+ * yukilinker_c_* runtime functions remain bound within that Core. */
+#if defined(__GNUC__)
+#define YUKILINKER_CORE_EXPORT __attribute__((visibility("default")))
+#else
+#define YUKILINKER_CORE_EXPORT
+#endif
+YUKILINKER_CORE_EXPORT void zygisk_core_entry(const char*, void*, void*, void*, int);
+YUKILINKER_CORE_EXPORT bool zygisk_adopt_anonymous_image(uintptr_t, size_t, void*);
+YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_handoff_ready(void);
+YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_take_dependencies(void* const*, size_t);
+YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_finish_handoff(bool);
+YUKILINKER_CORE_EXPORT void zygisk_finalize_loader(int, int);
+#if defined(__arm__)
+YUKILINKER_CORE_EXPORT bool zygisk_set_tango_stub(uint32_t, uint32_t);
+YUKILINKER_CORE_EXPORT void zygisk_finalize_loader_tango(uint32_t, uint32_t, uint32_t, int, int);
+#endif
+
+/* Frozen transport from YukiZygisk 509417ca, kernel/uapi/yukizygisk.h
+ * (Apache-2.0, Rouyashiki <https://rouyashiki.org>). The SDK only transfers/cleans these
+ * descriptors; the Core owns endpoint communication and configuration. */
+#define YUKILINKER_C_EARLY_PACKET_MAGIC UINT32_C(0x59504e5a)
+#define YUKILINKER_C_EARLY_PACKET_VERSION 3U
+#define YUKILINKER_C_EARLY_PACKET_MAX_ENTRIES 64U
+typedef struct yukilinker_c_early_packet_header {
+  uint32_t magic;
+  uint16_t version, header_size, entry_size, load_flags;
+  uint32_t count;
+  int32_t endpoint_fd;
+  uint32_t reserved;
+} yukilinker_c_early_packet_header;
+typedef struct yukilinker_c_early_packet_entry {
+  uint8_t target_type, flags;
+  uint16_t reserved;
+  char module_id[64], target[256], lib_path[512];
+  int32_t fd;
+  uint32_t tail_reserved;
+} yukilinker_c_early_packet_entry;
+
 enum yukilinker_c_feature {
   YUKILINKER_C_FEATURE_PACKED_RELOCS = 1,
   YUKILINKER_C_FEATURE_SYMBOL_VERSIONS = 2,
