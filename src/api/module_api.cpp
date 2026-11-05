@@ -174,6 +174,17 @@ void* context_create(void* opaque, const char* path, yukilinker_c_dependency_pro
   return token;
 }
 
+void* namespace_create(void* opaque, void* token) {
+  OperationGuard operation;
+  if (!owner(opaque)) return nullptr;
+  void* result = registry_namespace_create(token);
+  if (result) {
+    find_namespace(result)->context->strict_private = true;
+    find_namespace(result)->context->caller_stubs = true;
+  }
+  return result;
+}
+
 void* runtime_create(const yukilinker_c_host_services* services) {
   void* result = owner_runtime_create(services);
   if (result) {
@@ -626,6 +637,7 @@ void* module_context_create(void* opaque, const char* path,
                             yukilinker_c_dependency_provider provider, void* user) {
   return context_create(opaque, path, provider, user);
 }
+void* module_namespace_create(void* opaque, void* token) { return namespace_create(opaque, token); }
 yukilinker_c_handle module_open_path(void* runtime, const char* path,
                                      const yukilinker_c_open_options* options,
                                      yukilinker_c_error* output) {

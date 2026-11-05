@@ -173,4 +173,193 @@ uint32_t owner_context_destroy(void* opaque, void* context) {
   return loader_destroy_context(context) != 0;
 }
 
+// Registry operations return an error code, so a stale owner must not return zero.
+uint32_t owner_snapshot_acquire(void* opaque, void* context, uint64_t* token, size_t* count) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_snapshot_acquire(context, token, count);
+}
+
+uint32_t owner_snapshot_image(void* opaque, uint64_t token, size_t index,
+                              yukilinker_c_image_record* record) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_snapshot_image(token, index, record);
+}
+
+uint32_t owner_snapshot_headers(void* runtime, uint64_t token, size_t index, void* headers,
+                                size_t capacity, size_t* required) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_snapshot_headers(token, index, headers, capacity, required);
+}
+
+uint32_t owner_snapshot_release(void* runtime, uint64_t token) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_snapshot_release(token);
+}
+
+uint32_t owner_image_acquire(void* runtime, yukilinker_c_image_id id, uint32_t kind,
+                             uint64_t* lease) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_image_acquire_kind(id, kind, lease);
+}
+
+uint32_t owner_image_query(void* runtime, yukilinker_c_image_id id,
+                           yukilinker_c_image_record* record) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_image_query(id, record);
+}
+
+uint32_t owner_image_release(void* runtime, uint64_t lease) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_image_release(lease);
+}
+
+uint32_t owner_read_events(void* runtime, uint64_t cursor, yukilinker_c_runtime_event* events,
+                           size_t capacity, size_t* written, uint64_t* next_cursor) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_read_events(cursor, events, capacity, written, next_cursor);
+}
+
+uint32_t owner_namespace_destroy(void* runtime, void* token) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_namespace_destroy(token);
+}
+
+uint64_t owner_namespace_id(void* runtime, void* token) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return 0;
+  return registry_namespace_id(token);
+}
+
+uint32_t owner_snapshot_mapping(void* runtime, uint64_t token, size_t index,
+                                yukilinker_c_mapping_record* record) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return registry_snapshot_mapping(token, index, record);
+}
+
+uint32_t owner_image_detail(void* runtime, yukilinker_c_image_id id,
+                            yukilinker_c_image_detail* detail) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return query_image_detail(id, detail);
+}
+
+uint32_t owner_image_dependencies(void* runtime, yukilinker_c_image_id id,
+                                  yukilinker_c_dependency_record* records, size_t capacity,
+                                  size_t* count) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return query_image_dependencies(id, records, capacity, count);
+}
+
+uint32_t owner_image_program_headers(void* runtime, yukilinker_c_image_id id, void* headers,
+                                     size_t capacity, size_t* required) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return query_image_program_headers(id, headers, capacity, required);
+}
+
+uint32_t owner_namespace_link(void* runtime, void* from, void* to, uint32_t flags,
+                              const char* shared_sonames) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return api_namespace_link(from, to, flags, shared_sonames);
+}
+
+uint32_t owner_namespace_links(void* runtime, void* from,
+                               yukilinker_c_namespace_link_record* records, size_t capacity,
+                               size_t* count) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return api_namespace_links(from, records, capacity, count);
+}
+
+uint32_t owner_namespace_host_import(void* runtime, void* namespace_token,
+                                     const yukilinker_c_host_import* import) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return api_namespace_host_import(namespace_token, import);
+}
+
+// Only copies the thread's own record: no host call, no mapping, no lookup, and it ends no
+// operation of its own, so it never clears what it reports.
+uint32_t owner_host_import_refusal(void* opaque, yukilinker_c_host_import_refusal* refusal) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return api_host_import_refusal(refusal);
+}
+
+uint32_t owner_wait_timeout(void* opaque, uint64_t nanoseconds) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  __atomic_store_n(&g_wait_timeout_ns, nanoseconds, __ATOMIC_RELEASE);
+  return YUKILINKER_C_OK;
+}
+
+// One slot as it stood between two reads of its sequence, or false when it was free or kept
+// changing. Reads only: no lock, no allocation, nothing a thread holding the lock can block.
+bool read_wait_slot(const WaitSlot& slot, uint64_t now, yukilinker_c_load_wait* record) {
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    const uint32_t before = __atomic_load_n(&slot.sequence, __ATOMIC_ACQUIRE);
+    if (before & 1) continue;
+    const int32_t thread = __atomic_load_n(&slot.thread, __ATOMIC_RELAXED);
+    const uint32_t kind = __atomic_load_n(&slot.kind, __ATOMIC_RELAXED);
+    const int32_t owner = __atomic_load_n(&slot.owner, __ATOMIC_RELAXED);
+    const uint64_t generation = __atomic_load_n(&slot.generation, __ATOMIC_RELAXED);
+    const uint64_t namespace_id = __atomic_load_n(&slot.namespace_id, __ATOMIC_RELAXED);
+    const uint64_t start = __atomic_load_n(&slot.start_ns, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&slot.sequence, __ATOMIC_RELAXED) != before) continue;
+    if (thread == 0 || kind == 0) return false;
+    *record = {};
+    record->size = sizeof(*record);
+    record->kind = kind;
+    record->thread = thread;
+    record->owner = owner;
+    record->image = {generation, namespace_id};
+    record->elapsed_ns = now > start ? now - start : 0;
+    return true;
+  }
+  return false;
+}
+
+// No OperationGuard: answering while another thread holds the lock is the point. The owner is
+// read without the lock as well; a stale one is refused, a retired one past shutdown still reads.
+uint32_t owner_load_waits(void* opaque, yukilinker_c_load_wait* records, size_t capacity,
+                          size_t* count) {
+  if (opaque == nullptr || opaque != __atomic_load_n(&g_runtime_owner, __ATOMIC_ACQUIRE))
+    return YUKILINKER_C_STALE_TOKEN;
+  if (!count) return YUKILINKER_C_INVALID_HANDLE;
+  if (capacity != 0 && (!records || records[0].size != sizeof(yukilinker_c_load_wait)))
+    return YUKILINKER_C_UNSUPPORTED;
+  const uint64_t now = monotonic_now_ns();
+  size_t found = 0;
+  for (const WaitSlot& slot : g_wait_slots) {
+    yukilinker_c_load_wait record;
+    if (!read_wait_slot(slot, now, &record)) continue;
+    if (found < capacity) records[found] = record;
+    ++found;
+  }
+  const size_t overflow = __atomic_load_n(&g_wait_overflow, __ATOMIC_ACQUIRE);
+  *count = found + overflow;
+  return found <= capacity && overflow == 0 ? YUKILINKER_C_OK : YUKILINKER_C_BUFFER_TOO_SMALL;
+}
+
+uint32_t owner_namespace_host_imports(void* runtime, void* namespace_token,
+                                      yukilinker_c_host_import_record* records, size_t capacity,
+                                      size_t* count) {
+  OperationGuard operation;
+  if (runtime_from(runtime) == nullptr) return YUKILINKER_C_STALE_TOKEN;
+  return api_namespace_host_imports(namespace_token, records, capacity, count);
+}
+
 }  // namespace yukilinker::internal

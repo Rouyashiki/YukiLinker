@@ -643,6 +643,43 @@ YUKILINKER_C_API yukilinker_c_context* yukilinker_c_context_create(
 YUKILINKER_C_API uint32_t yukilinker_c_context_destroy(yukilinker_c_runtime* runtime,
                                                        yukilinker_c_context* context);
 
+YUKILINKER_C_API yukilinker_c_namespace* yukilinker_c_namespace_create(
+    yukilinker_c_runtime* runtime, yukilinker_c_context* parent);
+
+YUKILINKER_C_API uint32_t yukilinker_c_namespace_destroy(yukilinker_c_runtime* runtime,
+                                                         yukilinker_c_namespace* scope);
+
+YUKILINKER_C_API uint64_t yukilinker_c_namespace_id(yukilinker_c_runtime* runtime,
+                                                    yukilinker_c_namespace* scope);
+
+YUKILINKER_C_API uint32_t yukilinker_c_namespace_link(yukilinker_c_runtime* runtime,
+                                                      yukilinker_c_namespace* from,
+                                                      yukilinker_c_namespace* to, uint32_t flags,
+                                                      const char* shared_sonames);
+
+YUKILINKER_C_API uint32_t yukilinker_c_namespace_links(yukilinker_c_runtime* runtime,
+                                                       yukilinker_c_namespace* from,
+                                                       yukilinker_c_namespace_link_record* records,
+                                                       size_t capacity, size_t* count);
+
+YUKILINKER_C_API uint32_t
+yukilinker_c_namespace_host_import(yukilinker_c_runtime* runtime, yukilinker_c_namespace* scope,
+                                   const yukilinker_c_host_import* import);
+
+YUKILINKER_C_API uint32_t yukilinker_c_namespace_host_imports(
+    yukilinker_c_runtime* runtime, yukilinker_c_namespace* scope,
+    yukilinker_c_host_import_record* records, size_t capacity, size_t* count);
+
+YUKILINKER_C_API uint32_t yukilinker_c_query_host_import_refusal(
+    yukilinker_c_runtime* runtime, yukilinker_c_host_import_refusal* refusal);
+
+YUKILINKER_C_API uint32_t yukilinker_c_wait_timeout(yukilinker_c_runtime* runtime,
+                                                    uint64_t nanoseconds);
+
+YUKILINKER_C_API uint32_t yukilinker_c_load_waits(yukilinker_c_runtime* runtime,
+                                                  yukilinker_c_load_wait* records, size_t capacity,
+                                                  size_t* count);
+
 /* Each successful open owns one distinct generation handle. fd is borrowed, offset zero.
  * PRIVATE supports trusted_runtime for explicit host handoff. SYSTEM calls may execute
  * even on failure: UNKNOWN must not be interpreted as safe rollback. */
@@ -695,6 +732,79 @@ YUKILINKER_C_API uint32_t yukilinker_c_release_host(yukilinker_c_runtime* runtim
 YUKILINKER_C_API uint32_t yukilinker_c_handle_image(yukilinker_c_runtime* runtime,
                                                     yukilinker_c_handle handle,
                                                     yukilinker_c_image_record* output);
+
+/* Select at most one context/namespace. With neither specified, select all visible images.
+ * Snapshots pin their images until release. Program header capacities/required values are bytes. */
+YUKILINKER_C_API uint32_t yukilinker_c_snapshot_acquire(yukilinker_c_runtime* runtime,
+                                                        yukilinker_c_context* context,
+                                                        yukilinker_c_namespace* scope,
+                                                        yukilinker_c_snapshot* token,
+                                                        size_t* count);
+
+YUKILINKER_C_API uint32_t yukilinker_c_snapshot_image(yukilinker_c_runtime* runtime,
+                                                      yukilinker_c_snapshot token, size_t index,
+                                                      yukilinker_c_image_record* output);
+
+YUKILINKER_C_API uint32_t yukilinker_c_snapshot_program_headers(yukilinker_c_runtime* runtime,
+                                                                yukilinker_c_snapshot token,
+                                                                size_t index, void* headers,
+                                                                size_t capacity, size_t* required);
+
+YUKILINKER_C_API uint32_t yukilinker_c_snapshot_mapping(yukilinker_c_runtime* runtime,
+                                                        yukilinker_c_snapshot token, size_t index,
+                                                        yukilinker_c_mapping_record* output);
+
+/* Release consumes the token even if subsequent collection reports IO_ERROR. The in/out
+ * value is cleared exactly when consumed; inspect it before retrying a failed release. */
+YUKILINKER_C_API uint32_t yukilinker_c_snapshot_release(yukilinker_c_runtime* runtime,
+                                                        yukilinker_c_snapshot* token);
+
+YUKILINKER_C_API uint32_t yukilinker_c_image_acquire(yukilinker_c_runtime* runtime,
+                                                     yukilinker_c_image_id id, uint32_t kind,
+                                                     yukilinker_c_lease* lease);
+
+/* Like snapshot_release, clears the in/out token once consumed, including cleanup failure. */
+YUKILINKER_C_API uint32_t yukilinker_c_image_release(yukilinker_c_runtime* runtime,
+                                                     yukilinker_c_lease* lease);
+
+YUKILINKER_C_API uint32_t yukilinker_c_image_query(yukilinker_c_runtime* runtime,
+                                                   yukilinker_c_image_id id,
+                                                   yukilinker_c_image_record* record);
+
+YUKILINKER_C_API uint32_t yukilinker_c_query_image_detail(yukilinker_c_runtime* runtime,
+                                                          yukilinker_c_image_id id,
+                                                          yukilinker_c_image_detail* detail);
+
+YUKILINKER_C_API uint32_t yukilinker_c_image_dependencies(yukilinker_c_runtime* runtime,
+                                                          yukilinker_c_image_id id,
+                                                          yukilinker_c_dependency_record* records,
+                                                          size_t capacity, size_t* count);
+
+YUKILINKER_C_API uint32_t yukilinker_c_image_program_headers(yukilinker_c_runtime* runtime,
+                                                             yukilinker_c_image_id id,
+                                                             void* headers, size_t capacity,
+                                                             size_t* required);
+
+/* RETRY reports the oldest available cursor after ring overflow. BUFFER_TOO_SMALL reports
+ * required count and copies nothing; retry with adequate capacity. */
+YUKILINKER_C_API uint32_t yukilinker_c_read_events(yukilinker_c_runtime* runtime, uint64_t cursor,
+                                                   yukilinker_c_runtime_event* events,
+                                                   size_t capacity, size_t* written,
+                                                   uint64_t* next_cursor);
+
+/* Boolean result; name/address are borrowed only for the duration of the surrounding
+ * module/lease lifetime. Prefer copied image records for durable observations. */
+YUKILINKER_C_API uint32_t yukilinker_c_query_address(yukilinker_c_runtime* runtime,
+                                                     const void* address,
+                                                     yukilinker_c_image_info* output);
+
+/* Select at most one context/namespace. With neither specified, select all visible images.
+ * Returns the visitor's nonzero stop value, 0 at the end, or -1 on invalid arguments,
+ * an inactive owner, invalid scope or inability to acquire the iteration snapshot. */
+YUKILINKER_C_API int yukilinker_c_iterate_images(yukilinker_c_runtime* runtime,
+                                                 yukilinker_c_context* context,
+                                                 yukilinker_c_namespace* scope,
+                                                 yukilinker_c_image_visitor visitor, void* user);
 
 /* Controlled fork brackets; nest only on the same thread and pair with after_fork.
  * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
