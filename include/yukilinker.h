@@ -614,6 +614,17 @@ YUKILINKER_C_API yukilinker_c_runtime* yukilinker_c_runtime_create(
  * Stop all calls/TLS/callback users before destruction or unmapping the containing Core. */
 YUKILINKER_C_API uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* runtime);
 
+/* Provider success transfers its fd to the runtime. Search path is copied; provider/user
+ * remain valid until context destruction. Destruction refuses active references and seals
+ * the scope once retirement starts. A failed retirement can be resumed. */
+YUKILINKER_C_API yukilinker_c_context* yukilinker_c_context_create(
+    yukilinker_c_runtime* runtime, const char* search_path,
+    yukilinker_c_dependency_provider provider, void* user);
+
+/* Boolean: 1 destroyed, 0 retained. No callback may keep executing in a retired scope. */
+YUKILINKER_C_API uint32_t yukilinker_c_context_destroy(yukilinker_c_runtime* runtime,
+                                                       yukilinker_c_context* context);
+
 /* Each successful open owns one distinct generation handle. fd is borrowed, offset zero.
  * PRIVATE supports trusted_runtime for explicit host handoff. SYSTEM calls may execute
  * even on failure: UNKNOWN must not be interpreted as safe rollback. */
@@ -627,6 +638,13 @@ yukilinker_c_open_path(yukilinker_c_runtime* runtime, const char* path,
 YUKILINKER_C_API yukilinker_c_handle yukilinker_c_open_fd(yukilinker_c_runtime* runtime, int fd,
                                                           const yukilinker_c_open_options* options,
                                                           yukilinker_c_error* error);
+
+/* found distinguishes a valid null-valued symbol from a miss. Returned addresses are borrowed.
+ * Hold an execution lease or otherwise prevent retirement for the full duration of calls. */
+YUKILINKER_C_API yukilinker_c_lookup_result yukilinker_c_lookup(yukilinker_c_runtime* runtime,
+                                                                yukilinker_c_handle handle,
+                                                                const char* name,
+                                                                const char* version);
 
 YUKILINKER_C_API uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime,
                                              yukilinker_c_handle handle,

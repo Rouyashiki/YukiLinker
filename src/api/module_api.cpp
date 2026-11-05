@@ -161,6 +161,19 @@ __attribute__((always_inline)) inline void info(const Slot& slot,
     output->private_mapping_unmapped = 1;
 }
 
+void* context_create(void* opaque, const char* path, yukilinker_c_dependency_provider provider,
+                     void* user) {
+  OperationGuard operation;
+  if (!owner(opaque)) return nullptr;
+  void* token = loader_create_context(path, provider, user);
+  if (token) {
+    auto* context = context_from_opaque(token);
+    context->strict_private = true;
+    context->caller_stubs = true;
+  }
+  return token;
+}
+
 void* runtime_create(const yukilinker_c_host_services* services) {
   void* result = owner_runtime_create(services);
   if (result) {
@@ -291,6 +304,47 @@ yukilinker_c_handle open_path(void* runtime, const char* path,
 yukilinker_c_handle open_fd(void* runtime, int fd, const yukilinker_c_open_options* options,
                             yukilinker_c_error* output) {
   return open(runtime, nullptr, fd, true, options, output);
+}
+
+yukilinker_c_lookup_result lookup(void* opaque, yukilinker_c_handle handle, const char* name,
+                                  const char* version) {
+  OperationGuard operation;
+  yukilinker_c_lookup_result result{};
+  auto* runtime = owner(opaque);
+  auto* slot = runtime ? find(runtime, handle) : nullptr;
+  error(&result.error, runtime ? YUKILINKER_C_INVALID_HANDLE : YUKILINKER_C_STALE_TOKEN,
+        YUKILINKER_C_METADATA);
+  if (!slot || !name) return result;
+  if (slot->state != YUKILINKER_C_HANDLE_READY || system_uncertain(runtime->modules)) {
+    error(&result.error, YUKILINKER_C_BUSY, YUKILINKER_C_METADATA);
+    return result;
+  }
+  Pending pending(runtime->modules, slot);
+  if (slot->backend == YUKILINKER_C_BACKEND_PRIVATE) {
+    const auto value = loader_lookup(slot->raw, name, version);
+    result.address = value.address;
+    result.found = value.found;
+    private_error(&result.error, value.error);
+  } else {
+    const auto services = host_services();
+    CallbackGuard callback(nullptr);
+    (void)services.system_dlerror(services.user);
+    error(&result.error, YUKILINKER_C_OK, YUKILINKER_C_METADATA);
+    result.error.execution = YUKILINKER_C_EXECUTION_UNKNOWN;
+    result.found =
+        services.system_dlsym(services.user, slot->raw, name, version, &result.address) != 0;
+    if (!result.found)
+      system_error(services, &result.error, YUKILINKER_C_SYMBOL_MISSING, YUKILINKER_C_METADATA,
+                   "host system_dlsym failed without an error string");
+  }
+  if (pending.host_entered) result.error.execution = YUKILINKER_C_EXECUTION_UNKNOWN;
+  if (slot->state == YUKILINKER_C_HANDLE_UNCERTAIN) {
+    result.address = nullptr;
+    result.found = 0;
+    error(&result.error, YUKILINKER_C_BUSY, YUKILINKER_C_METADATA);
+    result.error.execution = YUKILINKER_C_EXECUTION_UNKNOWN;
+  }
+  return result;
 }
 
 uint32_t query(void* opaque, yukilinker_c_handle handle, yukilinker_c_handle_info* output) {
@@ -447,6 +501,10 @@ void* module_runtime_create(const yukilinker_c_host_services* services) {
   return runtime_create(services);
 }
 uint32_t module_runtime_destroy(void* opaque) { return runtime_destroy(opaque); }
+void* module_context_create(void* opaque, const char* path,
+                            yukilinker_c_dependency_provider provider, void* user) {
+  return context_create(opaque, path, provider, user);
+}
 yukilinker_c_handle module_open_path(void* runtime, const char* path,
                                      const yukilinker_c_open_options* options,
                                      yukilinker_c_error* output) {
@@ -455,6 +513,10 @@ yukilinker_c_handle module_open_path(void* runtime, const char* path,
 yukilinker_c_handle module_open_fd(void* runtime, int fd, const yukilinker_c_open_options* options,
                                    yukilinker_c_error* output) {
   return open_fd(runtime, fd, options, output);
+}
+yukilinker_c_lookup_result module_lookup(void* opaque, yukilinker_c_handle handle, const char* name,
+                                         const char* version) {
+  return lookup(opaque, handle, name, version);
 }
 uint32_t module_query(void* opaque, yukilinker_c_handle handle, yukilinker_c_handle_info* output) {
   return query(opaque, handle, output);

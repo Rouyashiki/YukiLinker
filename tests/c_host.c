@@ -45,6 +45,13 @@ __attribute__((visibility("default"))) int yukilinker_test_run(const char* direc
       fprintf(stderr, "open: %u %s %s\n", error.detail.code, error.detail.object,
               error.detail.symbol);
     assert(handle.generation);
+    yukilinker_c_lookup_result symbol = yukilinker_c_lookup(runtime, handle, "module_answer", NULL);
+    int (*answer)(void) = NULL;
+    _Static_assert(sizeof(answer) == sizeof(symbol.address), "Android function pointer layout");
+    memcpy(&answer, &symbol.address, sizeof(answer));
+    assert(symbol.found && answer() == 42);
+    assert(yukilinker_c_lookup(runtime, handle, "module_answer", "MODULE_API").found);
+    assert(!yukilinker_c_lookup(runtime, handle, "module_answer", "UNKNOWN").found);
     yukilinker_c_handle_info info = {0};
     yukilinker_c_handle stale = handle;
     ++stale.generation;

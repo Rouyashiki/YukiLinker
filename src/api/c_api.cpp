@@ -32,6 +32,18 @@ extern "C" uint32_t yukilinker_c_runtime_destroy(yukilinker_c_runtime* runtime) 
   return module_runtime_destroy(runtime);
 }
 
+extern "C" yukilinker_c_context* yukilinker_c_context_create(
+    yukilinker_c_runtime* runtime, const char* search_path,
+    yukilinker_c_dependency_provider provider, void* user) {
+  return reinterpret_cast<yukilinker_c_context*>(
+      module_context_create(runtime, search_path, provider, user));
+}
+
+extern "C" uint32_t yukilinker_c_context_destroy(yukilinker_c_runtime* runtime,
+                                                 yukilinker_c_context* context) {
+  return owner_context_destroy(runtime, context);
+}
+
 extern "C" yukilinker_c_handle yukilinker_c_open_path(yukilinker_c_runtime* runtime,
                                                       const char* path,
                                                       const yukilinker_c_open_options* options,
@@ -43,6 +55,12 @@ extern "C" yukilinker_c_handle yukilinker_c_open_fd(yukilinker_c_runtime* runtim
                                                     const yukilinker_c_open_options* options,
                                                     yukilinker_c_error* error) {
   return module_open_fd(runtime, fd, options, error);
+}
+
+extern "C" yukilinker_c_lookup_result yukilinker_c_lookup(yukilinker_c_runtime* runtime,
+                                                          yukilinker_c_handle handle,
+                                                          const char* name, const char* version) {
+  return module_lookup(runtime, handle, name, version);
 }
 
 extern "C" uint32_t yukilinker_c_query(yukilinker_c_runtime* runtime, yukilinker_c_handle handle,

@@ -100,4 +100,10 @@ uint32_t owner_runtime_destroy(void* opaque) {
   return destroyed;
 }
 
+uint32_t owner_context_destroy(void* opaque, void* context) {
+  OperationGuard operation;
+  if (runtime_from(opaque) == nullptr) return 0;
+  return loader_destroy_context(context) != 0;
+}
+
 }  // namespace yukilinker::internal
