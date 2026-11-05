@@ -814,6 +814,10 @@ YUKILINKER_C_API void yukilinker_c_prepare_fork(yukilinker_c_runtime* runtime);
  * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
 YUKILINKER_C_API void yukilinker_c_after_fork(yukilinker_c_runtime* runtime, int child);
 
+/* Best-effort host diagnostic only; does not release ownership or execute private module code. */
+YUKILINKER_C_API void yukilinker_c_report_unreleased(yukilinker_c_runtime* runtime,
+                                                     const char* object);
+
 #ifdef __cplusplus
 }
 #endif

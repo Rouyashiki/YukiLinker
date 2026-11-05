@@ -274,3 +274,10 @@ extern "C" void yukilinker_c_after_fork(yukilinker_c_runtime* runtime, int child
                                 __atomic_load_n(&g_runtime_owner, __ATOMIC_ACQUIRE)))
     loader_after_fork(child);
 }
+
+extern "C" void yukilinker_c_report_unreleased(yukilinker_c_runtime* runtime, const char* object) {
+  OperationGuard operation;
+  if (runtime && runtime == reinterpret_cast<yukilinker_c_runtime*>(g_runtime_owner) &&
+      g_runtime_owner->active)
+    host_log_error("%s", object ? object : "yukilinker: unreleased C++ ownership");
+}
