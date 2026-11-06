@@ -589,6 +589,47 @@ void yuki_bootstrap_tango(uint32_t got, uint32_t original, uint32_t stub, int co
 #endif
 #define YUKILINKER_C_TANGO_BOOTSTRAP_SIZE 224U
 
+/* Same-process native extension. No pointers in origin refer to the temporary
+ * injector. A successful bind consumes precisely loader_reference; refusal
+ * consumes nothing. The entry consumes descriptors under the normal bootstrap
+ * admission rules and tail-calls the same Core finalizer. */
+#define YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION 1U
+typedef struct yukilinker_c_native_origin {
+  uint32_t size, version, process, generation;
+  uint64_t linker_base, libc_base, libc_anchor;
+  char libc_path[256];
+} yukilinker_c_native_origin;
+#define YUKILINKER_C_NATIVE_LOADER_RETAINED 1U
+#define YUKILINKER_C_NATIVE_LOADER_ADOPTED 2U
+#define YUKILINKER_C_NATIVE_LOADER_RETURNED 4U
+typedef struct yukilinker_c_native_completion {
+  uint32_t size, version, process, generation;
+  int32_t error;
+  uint32_t ownership;
+} yukilinker_c_native_completion;
+typedef struct yukilinker_c_native_binding {
+  uint32_t size, version;
+  void* loader_reference;
+  yukilinker_c_native_origin origin;
+  /* Borrowed through entry only. Lives outside the temporary resolver and the
+   * loader. RETURNED permits exactly one external dlclose after entry returns;
+   * RETAINED/ADOPTED never permit the injector to release that reference. */
+  yukilinker_c_native_completion* completion;
+} yukilinker_c_native_binding;
+/* The error buffer belongs to the Core. The callback borrows request/fd and
+ * returns one owned Bionic reference. It never retains any request storage. */
+typedef void* (*yukilinker_c_native_open)(void*, const yukilinker_c_host_dlopen_request*, char*,
+                                          size_t);
+typedef struct yukilinker_c_native_services {
+  uint32_t size, version;
+  yukilinker_c_native_origin origin;
+  void* context;
+  yukilinker_c_native_open open;
+} yukilinker_c_native_services;
+typedef bool (*yukilinker_c_core_bind_native)(const yukilinker_c_native_services*);
+bool yuki_bootstrap_bind_native_v1(const yukilinker_c_native_binding*);
+void yuki_bootstrap_native_v1(int core_fd, int early_packet_fd_plus1);
+
 /* Required Core exports. The name is borrowed for the entry call; the Core
  * copies any data it retains. loader_anchor identifies the stage-one mapping.
  * The Core must prove that all persistent code/data/TLS/callback references
@@ -619,6 +660,7 @@ YUKILINKER_CORE_EXPORT bool zygisk_adopt_anonymous_image(uintptr_t, size_t, void
 YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_handoff_ready(void);
 YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_take_dependencies(void* const*, size_t);
 YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_finish_handoff(bool);
+YUKILINKER_CORE_EXPORT bool zygisk_bootstrap_bind_native_v1(const yukilinker_c_native_services*);
 YUKILINKER_CORE_EXPORT void zygisk_finalize_loader(int, int);
 #if defined(__arm__)
 YUKILINKER_CORE_EXPORT bool zygisk_set_tango_stub(uint32_t, uint32_t);

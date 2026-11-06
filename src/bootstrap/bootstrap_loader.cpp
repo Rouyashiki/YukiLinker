@@ -3,6 +3,7 @@
 
 // Bootstrap handoff and Tango protection derive from YukiZygisk 509417ca
 // (Apache-2.0, Rouyashiki <https://rouyashiki.org>). The load pipeline belongs to this SDK.
+#include <android/dlext.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -16,16 +17,55 @@ namespace {
 using namespace yukilinker::internal;
 using yukilinker::bootstrap::Descriptor;
 using yukilinker::bootstrap::Packet;
+enum class BootstrapPhase : uint32_t { Ordinary = 1, NativeBinding, NativeBound, NativeActive };
+uint64_t process_claim(uint32_t process, BootstrapPhase phase) {
+  return (uint64_t{process} << 32) | static_cast<uint32_t>(phase);
+}
+bool native_claim(uint64_t claim) {
+  const auto phase = static_cast<BootstrapPhase>(static_cast<uint32_t>(claim));
+  return phase == BootstrapPhase::NativeBinding || phase == BootstrapPhase::NativeBound ||
+         phase == BootstrapPhase::NativeActive;
+}
+// Binding and every entry compete on this same PID/phase word. Native origin
+// storage is published by the release transition from NativeBinding to NativeBound.
 alignas(8) uint64_t g_claim = 0;
 bool g_tango_required = false;
+bool g_native_required = false;
+void* g_native_reference = nullptr;
+yukilinker_c_native_origin g_native_origin{};
+yukilinker_c_native_completion* g_native_completion = nullptr;
+bool g_native_open = false;
+uint32_t g_native_calls = 0;
 struct TangoBootstrap {
   uint32_t got, original, stub;
 };
 struct BootstrapTarget {
   yukilinker_c_core_finalize normal = nullptr;
   yukilinker_c_core_finalize_tango tango = nullptr;
+  pid_t process = 0;
+  bool rolled_back = false;
 };
 void loader_anchor() {}
+
+__attribute__((noinline, disable_tail_calls)) void* native_open(
+    void*, const yukilinker_c_host_dlopen_request* request, char* error, size_t capacity) {
+  if (!request || request->size != sizeof(*request) || !error || !capacity ||
+      !__atomic_load_n(&g_native_open, __ATOMIC_ACQUIRE) ||
+      static_cast<uint32_t>(getpid()) != g_native_origin.process) {
+    if (error && capacity) snprintf(error, capacity, "native bootstrap window is closed");
+    return nullptr;
+  }
+  __atomic_add_fetch(&g_native_calls, 1U, __ATOMIC_ACQ_REL);
+  dlerror();
+  // Keep the real return address inside this Bionic-registered loader. The
+  // explicit post-call bookkeeping also forbids a sibling/tail call.
+  void* result = android_dlopen_ext(request->name, request->flags,
+                                    static_cast<const android_dlextinfo*>(request->extension));
+  const char* message = dlerror();
+  snprintf(error, capacity, "%s", message ? message : (result ? "" : "Bionic open failed"));
+  __atomic_sub_fetch(&g_native_calls, 1U, __ATOMIC_ACQ_REL);
+  return result;
+}
 
 void* own_reference(bool& cleanup_complete) {
   Dl_info self{};
@@ -187,42 +227,63 @@ static bool restore_tango_slot(const TangoBootstrap& tango) {
   return protected_again && (restored || expected == tango.original);
 }
 
-BootstrapTarget prepare_bootstrap(int core_fd, int packet_argument, const TangoBootstrap* tango) {
+BootstrapTarget prepare_bootstrap(int core_fd, int packet_argument, const TangoBootstrap* tango,
+                                  bool native = false) {
+  const uint64_t current = __atomic_load_n(&g_claim, __ATOMIC_ACQUIRE);
+  const auto phase = static_cast<BootstrapPhase>(static_cast<uint32_t>(current));
+  if (!native && native_claim(current)) {
+    errno = EPROTO;
+    return {};
+  }
+  if (native && ((phase != BootstrapPhase::NativeBound && phase != BootstrapPhase::NativeActive) ||
+                 g_native_origin.process != static_cast<uint32_t>(getpid()))) {
+    errno = EPROTO;
+    return {};
+  }
   if (core_fd < 0 || packet_argument < 0 || (packet_argument && packet_argument - 1 == core_fd)) {
     errno = EINVAL;
     return {};
   }
   const pid_t process = getpid();
-  uint64_t empty = 0;
-  const uint64_t claim = (uint64_t{static_cast<uint32_t>(process)} << 32) | 1U;
-  if (!__atomic_compare_exchange_n(&g_claim, &empty, claim, false, __ATOMIC_ACQ_REL,
+  uint64_t expected = native ? process_claim(process, BootstrapPhase::NativeBound) : 0;
+  const uint64_t claim =
+      process_claim(process, native ? BootstrapPhase::NativeActive : BootstrapPhase::Ordinary);
+  if (!__atomic_compare_exchange_n(&g_claim, &expected, claim, false, __ATOMIC_ACQ_REL,
                                    __ATOMIC_ACQUIRE)) {
-    errno = EBUSY;
+    errno = !native && native_claim(expected) ? EPROTO : EBUSY;
     return {};  // no ownership acquired; a fork child's descriptors are untouched too
   }
+  BootstrapTarget target;
+  target.process = process;
+  const auto rollback = [&] {
+    target.rolled_back = true;
+    // Native returns its reference to the injector. Keep admission closed while
+    // publishing that outcome and until the external owner releases the loader.
+    if (!native) __atomic_store_n(&g_claim, uint64_t{0}, __ATOMIC_RELEASE);
+  };
   Descriptor source;
   Packet packet;
   if (!source.capture(core_fd)) {
-    __atomic_store_n(&g_claim, uint64_t{0}, __ATOMIC_RELEASE);
-    return {};
+    rollback();
+    return target;
   }
   if (!packet.capture(packet_argument ? packet_argument - 1 : -1, core_fd)) {
     const bool closed = source.close_owned();
-    if (packet.close_owned() && closed) __atomic_store_n(&g_claim, uint64_t{0}, __ATOMIC_RELEASE);
+    if (packet.close_owned() && closed) rollback();
     errno = EPROTO;
-    return {};
+    return target;
   }
   bool reference_cleanup_complete = true;
-  void* loader = own_reference(reference_cleanup_complete);
+  void* loader = native ? g_native_reference : own_reference(reference_cleanup_complete);
   if (!loader || (tango && !restore_tango_slot(*tango))) {
     const bool source_closed = source.close_owned();
     const bool packet_closed = packet.close_owned();
     // A failed Tango protection restoration must not be forgotten.
     if (reference_cleanup_complete && source_closed && packet_closed &&
         (!tango || finish_tango_protection()))
-      __atomic_store_n(&g_claim, uint64_t{0}, __ATOMIC_RELEASE);
+      rollback();
     errno = EIO;
-    return {};
+    return target;
   }
   const char* name = sizeof(void*) == 8 ? "/data/adb/yukizygisk/lib/libzygisk64.so"
                                         : "/data/adb/yukizygisk/lib/libzygisk32.so";
@@ -233,24 +294,25 @@ BootstrapTarget prepare_bootstrap(int core_fd, int packet_argument, const TangoB
   options.origin = name;
   yukilinker_c_error_detail error{};
   g_tango_required = tango != nullptr;
+  g_native_required = native;
   auto* core = static_cast<SoHandle*>(loader_open_fd(core_fd, &options, &error));
   if (getpid() != process) {
     errno = EBUSY;
-    return {};
+    return target;
   }
   const bool source_closed = source.close_owned();
   if (!core) {
     const bool packet_closed = packet.close_owned();
     if (source_closed && packet_closed && !error.execution_started && !error.cleanup_incomplete &&
         shutdown())
-      __atomic_store_n(&g_claim, uint64_t{0}, __ATOMIC_RELEASE);
+      rollback();
     errno = error.system_errno ? error.system_errno : ENOEXEC;
-    return {};
+    return target;
   }
   if (!source_closed) {
     packet.close_owned();
     errno = EIO;
-    return {};
+    return target;
   }
   const auto entry = core_symbol<yukilinker_c_core_entry>(core, "zygisk_core_entry");
   const auto adopt = core_symbol<yukilinker_c_core_adopt>(core, "zygisk_adopt_anonymous_image");
@@ -263,42 +325,60 @@ BootstrapTarget prepare_bootstrap(int core_fd, int packet_argument, const TangoB
   const auto finalizer_tango =
       core_symbol<yukilinker_c_core_finalize_tango>(core, "zygisk_finalize_loader_tango");
   const auto set_tango = core_symbol<yukilinker_c_core_set_tango>(core, "zygisk_set_tango_stub");
-  if (!entry || !adopt || !ready || !take || !finish || !finalizer ||
+  const auto bind_native =
+      core_symbol<yukilinker_c_core_bind_native>(core, "zygisk_bootstrap_bind_native_v1");
+  if (!entry || !adopt || !ready || !take || !finish || !finalizer || (native && !bind_native) ||
       (tango && (!finalizer_tango || !set_tango))) {
     packet.close_owned();
     errno = ENOEXEC;  // constructors ran: preserve Core and its dependencies
-    return {};
+    return target;
   }
   if (tango && !set_tango(tango->stub, YUKILINKER_C_TANGO_BOOTSTRAP_SIZE)) {
     packet.close_owned();
     errno = EBUSY;
-    return {};
+    return target;
   }
   if (tango && getpid() != process) {
     errno = EBUSY;
-    return {};  // a child must not adopt the parent's in-flight mapping/reference
+    return target;  // a child must not adopt the parent's in-flight mapping/reference
   }
   const uintptr_t bias = reinterpret_cast<uintptr_t>(core->load_bias);
   const size_t span = core->map_size;
+  if (native) {
+    const yukilinker_c_native_services services{sizeof(services),
+                                                YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION,
+                                                g_native_origin, nullptr, native_open};
+    if (!bind_native(&services) || getpid() != process) {
+      packet.close_owned();
+      errno = EPROTO;
+      return target;
+    }
+  }
   if (!adopt(bias, span, loader)) {
     packet.close_owned();
     errno = EBUSY;
-    return {};
+    return target;
   }
   if (getpid() != process) {
     errno = EBUSY;
-    return {};
+    return target;
   }
+  if (native) g_native_reference = nullptr;  // Core now owns the original reference.
   // From this call the Core owns the packet, even when initialization refuses readiness.
+  __atomic_store_n(&g_native_open, native, __ATOMIC_RELEASE);
   entry(name, reinterpret_cast<void*>(loader_anchor), reinterpret_cast<void*>(bias),
         reinterpret_cast<void*>(span), packet_argument);
-  if (getpid() != process || !ready() || getpid() != process || !handoff(core, take, process) ||
-      !finish(true) || getpid() != process) {
+  __atomic_store_n(&g_native_open, false, __ATOMIC_RELEASE);
+  if (__atomic_load_n(&g_native_calls, __ATOMIC_ACQUIRE) || getpid() != process || !ready() ||
+      getpid() != process || !handoff(core, take, process) || !finish(true) ||
+      getpid() != process) {
     errno = EBUSY;
-    return {};
+    return target;
   }
   errno = 0;
-  return {finalizer, finalizer_tango};
+  target.normal = finalizer;
+  target.tango = finalizer_tango;
+  return target;
 }
 }  // namespace
 
@@ -327,8 +407,11 @@ bool validate_bootstrap_core(ImageState* image) {
                          "zygisk_bootstrap_finish_handoff",
                          "zygisk_finalize_loader",
                          "zygisk_set_tango_stub",
-                         "zygisk_finalize_loader_tango"};
-  for (size_t i = 0; i < (g_tango_required ? 8U : 6U); ++i) {
+                         "zygisk_finalize_loader_tango",
+                         "zygisk_bootstrap_bind_native_v1"};
+  for (size_t i = 0; i < 9; ++i) {
+    if ((i == 6 || i == 7) && !g_tango_required) continue;
+    if (i == 8 && !g_native_required) continue;
     const auto* symbol = find_defined_symbol(image, names[i]);
     bool executable = false;
     if (symbol && ELF64_ST_TYPE(symbol->st_info) == STT_FUNC) {
@@ -350,6 +433,66 @@ bool validate_bootstrap_core(ImageState* image) {
 
 extern "C" [[gnu::visibility("default")]] void yuki_bootstrap(int core_fd, int packet_argument) {
   const auto target = prepare_bootstrap(core_fd, packet_argument, nullptr);
+  if (target.normal) [[clang::musttail]]
+    return target.normal(0, 0);
+}
+extern "C" [[gnu::visibility("default")]] bool yuki_bootstrap_bind_native_v1(
+    const yukilinker_c_native_binding* binding) {
+  if (!binding || binding->size != sizeof(*binding) ||
+      binding->version != YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION ||
+      binding->origin.size != sizeof(binding->origin) ||
+      binding->origin.version != YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION ||
+      binding->origin.process != static_cast<uint32_t>(getpid()) || !binding->origin.generation ||
+      !binding->loader_reference || !binding->completion ||
+      binding->completion->size != sizeof(*binding->completion) ||
+      binding->completion->version != YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION ||
+      binding->completion->process != binding->origin.process ||
+      binding->completion->generation != binding->origin.generation ||
+      !binding->origin.linker_base || !binding->origin.libc_base || !binding->origin.libc_anchor ||
+      !memchr(binding->origin.libc_path, 0, sizeof(binding->origin.libc_path)) ||
+      __atomic_load_n(&g_claim, __ATOMIC_ACQUIRE))
+    return false;
+  Dl_info provider{};
+  if (::dlsym(binding->loader_reference, "yuki_bootstrap_native_v1") !=
+          reinterpret_cast<void*>(yuki_bootstrap_native_v1) ||
+      ::dlsym(binding->loader_reference, "getpid") !=
+          reinterpret_cast<void*>(static_cast<uintptr_t>(binding->origin.libc_anchor)) ||
+      !::dladdr(reinterpret_cast<void*>(static_cast<uintptr_t>(binding->origin.libc_anchor)),
+                &provider) ||
+      reinterpret_cast<uintptr_t>(provider.dli_fbase) != binding->origin.libc_base ||
+      !provider.dli_fname || strcmp(provider.dli_fname, binding->origin.libc_path))
+    return false;
+  uint64_t expected = 0;
+  const uint64_t claim = process_claim(binding->origin.process, BootstrapPhase::NativeBinding);
+  if (!__atomic_compare_exchange_n(&g_claim, &expected, claim, false, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE))
+    return false;
+  g_native_origin = binding->origin;
+  g_native_reference = binding->loader_reference;
+  g_native_completion = binding->completion;
+  g_native_completion->ownership = YUKILINKER_C_NATIVE_LOADER_RETAINED;
+  __atomic_store_n(&g_claim, process_claim(binding->origin.process, BootstrapPhase::NativeBound),
+                   __ATOMIC_RELEASE);
+  return true;
+}
+
+extern "C" [[gnu::visibility("default")]] void yuki_bootstrap_native_v1(int core_fd,
+                                                                        int packet_argument) {
+  const auto target = prepare_bootstrap(core_fd, packet_argument, nullptr, true);
+  if (target.process != getpid()) return;
+  auto* completion = g_native_completion;
+  g_native_completion = nullptr;
+  if (completion) {
+    completion->error = target.normal ? 0 : (errno ? errno : EIO);
+    completion->ownership = g_native_reference ? YUKILINKER_C_NATIVE_LOADER_RETAINED
+                                               : YUKILINKER_C_NATIVE_LOADER_ADOPTED;
+    // Only the admitted operation can return its reference after a complete
+    // rollback; never dlclose our own return chain.
+    if (g_native_reference && target.rolled_back) {
+      completion->ownership = YUKILINKER_C_NATIVE_LOADER_RETURNED;
+      g_native_reference = nullptr;
+    }
+  }
   if (target.normal) [[clang::musttail]]
     return target.normal(0, 0);
 }

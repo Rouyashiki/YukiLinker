@@ -32,8 +32,16 @@ size_t dependency_count;
 bool adopted, transferred, committed;
 const void* api;
 yukilinker_c_runtime* owner;
+yukilinker_c_native_services native_services{};
+yukilinker_c_handle native_module{};
+char native_error[256]{};
 [[gnu::noinline, clang::disable_tail_calls]] void* open_system(
     void*, const yukilinker_c_host_dlopen_request* request) {
+  if (native_services.open) {
+    ++control->native_opens;
+    return native_services.open(native_services.context, request, native_error,
+                                sizeof(native_error));
+  }
   return dlopen(request->name, request->flags);
 }
 [[gnu::noinline, clang::disable_tail_calls]] int lookup_system(void*, void* handle,
@@ -72,6 +80,13 @@ bool in_core(const void* pointer) {
   return p >= control->base && p - control->base < control->span;
 }
 int exercise(const char* fixtures) {
+  if (native_module.generation) {
+    const auto symbol = yukilinker_c_lookup(owner, native_module, "module_answer", nullptr);
+    assert(symbol.found && reinterpret_cast<int (*)()>(symbol.address)() == 42);
+    const auto closed = yukilinker_c_close(owner, native_module);
+    assert(!closed.handle_valid && closed.error.detail.code == YUKILINKER_C_OK);
+    native_module = {};
+  }
   char path[4096];
   snprintf(path, sizeof(path), "%s/liblinker_module.so", fixtures);
   yukilinker_c_open_options options{
@@ -169,6 +184,15 @@ __attribute__((constructor)) void construct() {
 }
 }  // namespace
 #define CORE_EXPORT extern "C" __attribute__((visibility("default")))
+CORE_EXPORT bool zygisk_bootstrap_bind_native_v1(const yukilinker_c_native_services* incoming) {
+  ++control->native_binds;
+  if (native_services.open || control->mode == BootCase::RejectNativeBinding || !incoming ||
+      incoming->size != sizeof(*incoming) || incoming->version != 1 ||
+      incoming->origin.process != static_cast<uint32_t>(getpid()) || !incoming->open)
+    return false;
+  native_services = *incoming;
+  return true;
+}
 CORE_EXPORT bool zygisk_adopt_anonymous_image(uintptr_t base, size_t span, void* reference) {
   if (adopted || control->mode == BootCase::ReusePacket) return false;
   control->base = base;
@@ -198,6 +222,21 @@ CORE_EXPORT void zygisk_core_entry(const char*, void* loader_anchor, void*, void
   control->loader_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
   api = reinterpret_cast<const void*>(yukilinker_c_abi_version);
   owner = yukilinker_c_runtime_create(&host);
+  if (native_services.open) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/liblinker_module.so", getenv("YUKILINKER_TEST_FIXTURES"));
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    assert(fd >= 0);
+    yukilinker_c_open_options options{};
+    options.size = sizeof(options);
+    options.backend = YUKILINKER_C_BACKEND_SYSTEM;
+    options.flags = RTLD_NOW | RTLD_LOCAL;
+    options.origin = path;
+    native_module = yukilinker_c_open_fd(owner, fd, &options, nullptr);
+    assert(native_module.generation && close(fd) == 0);
+    native_services.open = nullptr;
+    native_services.context = nullptr;
+  }
   control->api = api;
   control->owner = owner;
   control->open = yukilinker_c_open_path;
@@ -208,7 +247,8 @@ CORE_EXPORT void zygisk_core_entry(const char*, void* loader_anchor, void*, void
   assert(__cxa_atexit(exit_callback, nullptr, &__dso_handle) == 0);
 }
 CORE_EXPORT bool zygisk_bootstrap_handoff_ready() {
-  return owner && control->mode != BootCase::RejectReady && in_core(api) &&
+  return owner && !native_services.open && !native_services.context &&
+         control->mode != BootCase::RejectReady && in_core(api) &&
          in_core(reinterpret_cast<void*>(yukilinker_c_open_path)) &&
          in_core(reinterpret_cast<void*>(yukilinker_c_runtime_destroy)) && in_core(&host) &&
          in_core(reinterpret_cast<void*>(host.system_dlopen));

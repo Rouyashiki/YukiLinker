@@ -15,7 +15,8 @@ enum class BootCase {
   Reenter,
   CleanupFailure,
   ReusePacket,
-  ForkTango
+  ForkTango,
+  RejectNativeBinding
 };
 struct BootControl {
   BootCase mode = BootCase::Success;
@@ -40,4 +41,5 @@ struct BootControl {
   int reused_fd = -1;
   uint32_t tango_stub = 0, tango_size = 0;
   unsigned tango_finalized = 0;
+  unsigned native_binds = 0, native_opens = 0;
 };

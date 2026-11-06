@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -27,8 +28,22 @@ int (*real_dlclose)(void*);
 uintptr_t loader_low, loader_high;
 bool refuse_cleanup;
 unsigned cleanup_failures;
+thread_local unsigned native_pid_calls;
+thread_local unsigned pause_pid_call = 2;
+thread_local bool pause_native_claim;
+unsigned native_claim_entered, native_claim_release;
 void arm_cleanup() { refuse_cleanup = true; }
 }  // namespace
+extern "C" pid_t getpid() {
+  const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  if (pause_native_claim && caller >= loader_low && caller < loader_high &&
+      ++native_pid_calls == pause_pid_call) {
+    // Hold the real entry before its admission CAS.
+    __atomic_store_n(&native_claim_entered, 1U, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&native_claim_release, __ATOMIC_ACQUIRE)) usleep(1000);
+  }
+  return static_cast<pid_t>(syscall(__NR_getpid));
+}
 extern "C" int munmap(void* address, size_t bytes) {
   const auto caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
   if (refuse_cleanup && caller >= loader_low && caller < loader_high) {
@@ -80,7 +95,61 @@ int open_core(const char* form) {
   assert(fd >= 0);
   return fd;
 }
-void load(BootControl& control, const char* form, bool tango = false, bool retry = false) {
+yukilinker_c_native_binding native_binding(void* library,
+                                           yukilinker_c_native_completion& completion) {
+  Dl_info libc{};
+  void* anchor = dlsym(library, "getpid");
+  assert(anchor && dladdr(anchor, &libc));
+  yukilinker_c_native_binding request{};
+  request.size = sizeof(request);
+  request.version = YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION;
+  request.loader_reference = library;
+  request.completion = &completion;
+  request.origin = {sizeof(request.origin),
+                    YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION,
+                    static_cast<uint32_t>(getpid()),
+                    completion.generation,
+                    getauxval(AT_BASE),
+                    reinterpret_cast<uintptr_t>(libc.dli_fbase),
+                    reinterpret_cast<uintptr_t>(anchor),
+                    {}};
+  snprintf(request.origin.libc_path, sizeof(request.origin.libc_path), "%s", libc.dli_fname);
+  return request;
+}
+void native_admission_race(BootControl& control, int core,
+                           yukilinker_c_native_completion& completion) {
+  struct Call {
+    void (*entry)(int, int);
+    int fd;
+    bool pause;
+    int error = 0;
+  } accepted{control.bootstrap, core, false}, rejected{control.bootstrap, control.retry_fd, true};
+  const auto invoke = [](void* opaque) -> void* {
+    auto& call = *static_cast<Call*>(opaque);
+    pause_native_claim = call.pause;
+    call.entry(call.fd, 0);
+    call.error = errno;
+    pause_native_claim = false;
+    return nullptr;
+  };
+  completion.error = EINPROGRESS;
+  const auto untouched = completion;
+  pthread_t first, second;
+  assert(pthread_create(&second, nullptr, invoke, &rejected) == 0);
+  while (!__atomic_load_n(&native_claim_entered, __ATOMIC_ACQUIRE)) usleep(1000);
+  assert(pthread_create(&first, nullptr, invoke, &accepted) == 0);
+  while (!__atomic_load_n(&control.entered, __ATOMIC_ACQUIRE)) usleep(1000);
+  __atomic_store_n(&native_claim_release, 1U, __ATOMIC_RELEASE);
+  assert(pthread_join(second, nullptr) == 0);
+  assert(rejected.error == EBUSY && fcntl(rejected.fd, F_GETFD) >= 0);
+  assert(!memcmp(&completion, &untouched, sizeof(completion)));
+  assert(control.constructors == 1 && control.entries == 0);
+  __atomic_store_n(&control.release, 1U, __ATOMIC_RELEASE);
+  assert(pthread_join(first, nullptr) == 0 && accepted.error == 0);
+  assert(completion.error == 0 && completion.ownership == YUKILINKER_C_NATIVE_LOADER_ADOPTED);
+}
+void load(BootControl& control, const char* form, bool tango = false, bool retry = false,
+          bool native = false, bool rollback = false) {
   char pointer[32];
   snprintf(pointer, sizeof(pointer), "%llx", (unsigned long long)&control);
   assert(setenv("YUKILINKER_TEST_CONTROL", pointer, 1) == 0);
@@ -91,6 +160,57 @@ void load(BootControl& control, const char* form, bool tango = false, bool retry
   control.arm_cleanup_failure = arm_cleanup;
   control.bootstrap = reinterpret_cast<void (*)(int, int)>(dlsym(library, "yuki_bootstrap"));
   assert(control.bootstrap);
+  yukilinker_c_native_completion completion{
+      sizeof(completion), 1, static_cast<uint32_t>(getpid()), 1, 0, 0};
+  if (native) {
+    auto bind = reinterpret_cast<bool (*)(const yukilinker_c_native_binding*)>(
+        dlsym(library, "yuki_bootstrap_bind_native_v1"));
+    auto entry = reinterpret_cast<void (*)(int, int)>(dlsym(library, "yuki_bootstrap_native_v1"));
+    assert(bind && entry && !bind(nullptr));
+    auto request = native_binding(library, completion);
+    ++request.version;
+    assert(!bind(&request));
+    --request.version;
+    assert(bind(&request) && !bind(&request));
+    int untouched = open_core(form);
+    control.bootstrap(untouched, 0);
+    assert(errno == EPROTO && fcntl(untouched, F_GETFD) >= 0);
+    if (control.mode != BootCase::HoldConstructor) {
+      const auto before = completion;
+      entry(-1, 0);
+      assert(errno == EINVAL && !memcmp(&completion, &before, sizeof(completion)));
+      entry(untouched, untouched + 1);
+      assert(errno == EINVAL && fcntl(untouched, F_GETFD) >= 0 &&
+             !memcmp(&completion, &before, sizeof(completion)));
+    }
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+      entry(untouched, 0);
+      _exit(errno == EPROTO && fcntl(untouched, F_GETFD) >= 0 ? 0 : 1);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && status == 0);
+    close(untouched);
+    control.bootstrap = entry;
+    assert(setenv("YUKILINKER_TEST_FIXTURES", fixtures, 1) == 0);
+  }
+  if (rollback) {
+    const int invalid = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    assert(native && invalid >= 0);
+    control.bootstrap(invalid, 0);
+    assert(completion.error != 0 && completion.ownership == YUKILINKER_C_NATIVE_LOADER_RETURNED &&
+           fcntl(invalid, F_GETFD) < 0 && control.constructors == 0 && loader_count() == 1);
+    const auto returned = completion;
+    const int retry_fd = open_core(form);
+    control.bootstrap(retry_fd, 0);
+    assert(errno == EBUSY && fcntl(retry_fd, F_GETFD) >= 0 &&
+           !memcmp(&completion, &returned, sizeof(completion)));
+    close(retry_fd);
+    assert(dlclose(library) == 0 && loader_count() == 0);
+    unsetenv("YUKILINKER_TEST_CONTROL");
+    return;
+  }
   if (retry) {
     control.bootstrap(-1, 0);
     assert(errno == EINVAL && loader_count() == 1);
@@ -139,12 +259,18 @@ void load(BootControl& control, const char* form, bool tango = false, bool retry
 #else
   (void)tango;
 #endif
+      if (native && control.mode == BootCase::HoldConstructor)
+    native_admission_race(control, core, completion);
+  else
     control.bootstrap(core, control.packet_argument);
   assert(fcntl(core, F_GETFD) == -1 && errno == EBADF);
   assert(fcntl(control.retry_fd, F_GETFD) >= 0);  // reentry must not consume its input
   close(control.retry_fd);
   unsetenv("YUKILINKER_TEST_CONTROL");
   assert(control.constructors == 1);
+  if (native)
+    assert(completion.ownership == (control.adopted ? YUKILINKER_C_NATIVE_LOADER_ADOPTED
+                                                    : YUKILINKER_C_NATIVE_LOADER_RETAINED));
 }
 void retire(BootControl& control);
 struct EarlyPacket {
@@ -238,10 +364,92 @@ void retire(BootControl& control) {
   int status = 0;
   assert(waitpid(child, &status, 0) == child && status == 0);
 }
-void success(const char* form, BootCase mode, bool tango, bool retry) {
+void binding_admission(bool native_wins, bool tango = false) {
+  BootControl control{};
+  control.mode = native_wins ? BootCase::Success : BootCase::HoldConstructor;
+  char pointer[32];
+  snprintf(pointer, sizeof(pointer), "%llx", (unsigned long long)&control);
+  assert(setenv("YUKILINKER_TEST_CONTROL", pointer, 1) == 0);
+  assert(setenv("YUKILINKER_TEST_FIXTURES", fixtures, 1) == 0);
+  void* library = dlopen(loader_name, RTLD_NOW | RTLD_LOCAL);
+  assert(library && loader_count() == 1);
+  auto bind = reinterpret_cast<bool (*)(const yukilinker_c_native_binding*)>(
+      dlsym(library, "yuki_bootstrap_bind_native_v1"));
+  auto native = reinterpret_cast<void (*)(int, int)>(dlsym(library, "yuki_bootstrap_native_v1"));
+  struct Call {
+    void (*entry)(int, int);
+    void (*tango)(uint32_t, uint32_t, uint32_t, int, int);
+    int fd;
+    bool pause;
+    uint32_t slot = 0;
+    int error = 0;
+  } call{reinterpret_cast<void (*)(int, int)>(dlsym(library, "yuki_bootstrap")),
+         tango ? reinterpret_cast<void (*)(uint32_t, uint32_t, uint32_t, int, int)>(
+                     dlsym(library, "yuki_bootstrap_tango"))
+               : nullptr,
+         open_core("sources"), native_wins};
+  assert(bind && native && call.entry && (!tango || call.tango));
+  // Keep the observed descriptor outside emulator/runtime helper allocation.
+  const int original = call.fd;
+  call.fd = fcntl(original, F_DUPFD_CLOEXEC, 128);
+  assert(call.fd >= 0 && close(original) == 0);
+  const uint32_t stub = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&call.slot));
+  call.slot = stub | 1U;
+  yukilinker_c_native_completion completion{
+      sizeof(completion), 1, static_cast<uint32_t>(getpid()), 1, EINPROGRESS, 0};
+  const auto request = native_binding(library, completion);
+  const auto unbound = completion;
+  pthread_t thread;
+  const auto invoke = [](void* opaque) -> void* {
+    auto& call = *static_cast<Call*>(opaque);
+    pause_native_claim = call.pause;
+    pause_pid_call = 1;
+    if (call.tango) {
+      const auto slot = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&call.slot));
+      call.tango(slot, 0x12345678U, slot, call.fd, 0);
+    } else {
+      call.entry(call.fd, 0);
+    }
+    call.error = errno;
+    return nullptr;
+  };
+  assert(pthread_create(&thread, nullptr, invoke, &call) == 0);
+  auto* entered = native_wins ? &native_claim_entered : &control.entered;
+  while (!__atomic_load_n(entered, __ATOMIC_ACQUIRE)) usleep(1000);
+  assert(bind(&request) == native_wins);
+  const auto bound = completion;
+  if (!native_wins) {
+    assert(!memcmp(&completion, &unbound, sizeof(completion)));
+    const int fd = open_core("sources");
+    native(fd, 0);
+    assert(errno == EPROTO && fcntl(fd, F_GETFD) >= 0 &&
+           !memcmp(&completion, &unbound, sizeof(completion)));
+    close(fd);
+  }
+  __atomic_store_n(native_wins ? &native_claim_release : &control.release, 1U, __ATOMIC_RELEASE);
+  assert(pthread_join(thread, nullptr) == 0);
+  if (native_wins) {
+    assert(call.error == EPROTO && fcntl(call.fd, F_GETFD) >= 0);
+    assert(!memcmp(&completion, &bound, sizeof(completion)) && control.constructors == 0);
+    assert(call.slot == (stub | 1U));
+    native(call.fd, 0);
+    assert(completion.error == 0 && completion.ownership == YUKILINKER_C_NATIVE_LOADER_ADOPTED);
+    assert(control.native_binds == 1 && control.native_opens == 1);
+  } else {
+    assert(call.error == 0 && control.native_binds == 0);
+    if (tango) assert(call.slot == 0x12345678U && control.tango_finalized == 1);
+  }
+  assert(fcntl(call.fd, F_GETFD) < 0 && errno == EBADF);
+  assert(control.constructors == 1 && control.adopted == 1 && control.finalized == 1);
+  assert(loader_count() == 0 && control.exercise(fixtures));
+  retire(control);
+  unsetenv("YUKILINKER_TEST_CONTROL");
+}
+void success(const char* form, BootCase mode, bool tango, bool retry, bool native = false) {
   BootControl control{};
   control.mode = mode;
-  load(control, form, tango, retry);
+  load(control, form, tango, retry, native);
+  if (native) assert(control.native_binds == 1 && control.native_opens == 1);
   assert(control.entries == 1 && control.adopted == 1 && control.takes == 1 &&
          control.finishes == 1 && control.finalized == 1 && control.dependencies != 0);
   assert(loader_count() == 0);
@@ -385,7 +593,27 @@ int main(int argc, char** argv) {
   isolated("packet_reused_fd", packet_reuse);
   isolated("two_cores", isolation);
   isolated("concurrent_fork", concurrency);
+  isolated("native_binding_wins", [] { binding_admission(true); });
+  isolated("ordinary_entry_wins", [] { binding_admission(false); });
+  isolated("native_concurrent_admission",
+           [] { success("sources", BootCase::HoldConstructor, false, false, true); });
+  isolated("native_archive", [] { success("archive", BootCase::Success, false, false, true); });
+  isolated("native_sources_reentry",
+           [] { success("sources", BootCase::Reenter, false, false, true); });
+  isolated("native_bind_refusal", [] {
+    BootControl control{};
+    control.mode = BootCase::RejectNativeBinding;
+    load(control, "sources", false, false, true);
+    assert(control.native_binds == 1 && control.native_opens == 0 && control.entries == 0 &&
+           control.adopted == 0 && control.finalized == 0 && loader_count() == 1);
+  });
+  isolated("native_preexecution_rollback", [] {
+    BootControl control{};
+    load(control, "sources", false, false, true, true);
+  });
 #if defined(__arm__)
+  isolated("native_binding_beats_tango", [] { binding_admission(true, true); });
+  isolated("tango_entry_wins", [] { binding_admission(false, true); });
   isolated("tango", [] { success("archive", BootCase::Success, true, false); });
   isolated("tango_fork", [] { success("archive", BootCase::ForkTango, true, false); });
 #endif

@@ -74,3 +74,44 @@ Coordinate host activity, call `prepare_fork`, fork, then call `after_fork` in
 both processes with the corresponding child flag. Destroy runtime before
 unloading Core so TLS keys and libc callback registrations can retire while
 their code is still callable.
+
+## Native same-process extension v1
+
+Native injectors can supply a verified host origin and the exact initial loader
+reference through `yuki_bootstrap_bind_native_v1`. The binding carries explicit
+size/version, PID and generation. It copies origin storage; successful binding
+consumes one loader reference and refusal consumes none. Native entry requires
+this binding and refuses the old ordinary entry on the same instance.
+Existing C ABI1, HostServices1 and packet-v3 layouts remain unchanged.
+
+Binding and ordinary/Tango entry compete on one atomic PID/phase claim. Binding
+reserves the instance before publishing origin or completion storage, then only
+native entry can advance the bound claim to execution. A losing binding consumes
+no reference or completion storage; a losing entry consumes no input descriptors.
+
+`yuki_bootstrap_native_v1(int core_fd, int packet_fd_plus1)` validates the Core's
+`zygisk_bootstrap_bind_native_v1` export before Core execution. Core receives and
+copies a synchronous temporary open service before adoption. Its HostServices
+may call this service for explicit SYSTEM opens during Core entry. The service
+borrows fd/request storage and copies errors into Core-owned buffers. It returns
+one Bionic reference directly into the existing SYSTEM slot. The real
+`android_dlopen_ext` call must retain its return address in the Bionic-registered
+loader, never the anonymous Core.
+
+Core must stop new opens, drain service calls and erase the callback/context
+before reporting ready. No callback, service buffer or resolver pointer may
+survive into the finalizer. The unchanged adoption/dependencies/finish protocol
+then transfers the loader reference and forces a tail call to Core's finalizer.
+An incomplete handoff in a fork child cannot reuse the inherited window.
+
+Binding also borrows a `yukilinker_c_native_completion` record until entry
+returns or tail-calls. Its storage must live outside both the resolver and
+loader. RETAINED preserves unresolved ownership; ADOPTED assigns ownership to
+Core; RETURNED gives the exact reference back only after a complete
+pre-execution rollback. Only RETURNED authorizes one external `dlclose` after
+entry returns. Early reentry/fork admission rejection does not overwrite the
+original operation's completion. Only the invocation that acquired the claim in
+the current process may consume the record. Native admission remains closed
+through rollback publication and until the returned loader reference is released;
+retry starts with a fresh loader binding. Clear all loader-owned pointers to the
+record before the finalizer can unload the loader.
