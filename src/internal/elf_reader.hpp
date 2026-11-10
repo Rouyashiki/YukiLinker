@@ -116,9 +116,23 @@ bool inspect(const void* source, size_t bytes, size_t page_size, uint16_t machin
     return false;
   for (size_t i = 0; i < header->e_phnum; ++i) {
     const auto& ph = headers[i];
-    if (ph.p_type == PT_GNU_RELRO && ph.p_memsz &&
-        !segment_contains(headers, header->e_phnum, ph.p_vaddr, ph.p_memsz, PF_R | PF_W))
-      return false;
+    if (ph.p_type != PT_GNU_RELRO || !ph.p_memsz) continue;
+    bool covered = false;
+    for (size_t j = 0; j < header->e_phnum; ++j) {
+      const auto& load = headers[j];
+      if (load.p_type != PT_LOAD || (load.p_flags & (PF_R | PF_W)) != (PF_R | PF_W) ||
+          !load.p_memsz || ph.p_vaddr < load.p_vaddr || ph.p_vaddr - load.p_vaddr >= load.p_memsz)
+        continue;
+      // Linkers may pad RELRO past p_memsz to the mapped page boundary. The PT_LOAD
+      // checks above already proved this rounding cannot overflow the target address width.
+      const uint64_t end =
+          (uint64_t{load.p_vaddr} + load.p_memsz + page_size - 1) & ~(uint64_t{page_size} - 1);
+      if (range(end - load.p_vaddr, ph.p_vaddr - load.p_vaddr, ph.p_memsz)) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) return false;
   }
   if (unsupported) {
     out->unsupported = true;

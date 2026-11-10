@@ -4,10 +4,12 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,6 +23,7 @@
 #include <utility>
 
 #include "host_services.h"
+#include "relro_fixture.hpp"
 
 #if defined(YUKILINKER_TEST_NOEXCEPT)
 #if defined(__EXCEPTIONS) || defined(__GXX_RTTI)
@@ -74,6 +77,62 @@ void exercise_lifecycle(yukilinker::Runtime& runtime, const char* directory) {
   if (!retired) _exit(forks == 0 ? 0 : 1);
   assert(waitpid(retired, &status, 0) == retired && status == 0);
 }
+
+void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* path) {
+  const int source = open(path, O_RDONLY | O_CLOEXEC);
+  struct stat status{};
+  assert(source >= 0 && fstat(source, &status) == 0 && status.st_size > 0);
+  const size_t bytes = status.st_size;
+  void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE, source, 0);
+  assert(data != MAP_FAILED && close(source) == 0);
+  const auto* header = static_cast<const ElfW(Ehdr)*>(data);
+  auto* segments = reinterpret_cast<ElfW(Phdr)*>(static_cast<char*>(data) + header->e_phoff);
+  const size_t page = sysconf(_SC_PAGESIZE);
+  const auto page_end = [page](uintptr_t address) { return (address + page - 1) & ~(page - 1); };
+  const ElfW(Phdr)* relro = nullptr;
+  for (size_t i = 0; i < header->e_phnum; ++i)
+    if (segments[i].p_type == PT_GNU_RELRO) relro = &segments[i];
+  assert(relro && relro->p_memsz);
+  bool trimmed = false;
+  for (size_t i = 0; i < header->e_phnum; ++i) {
+    auto& load = segments[i];
+    if (load.p_type != PT_LOAD || load.p_vaddr != relro->p_vaddr) continue;
+    assert(load.p_memsz == relro->p_memsz && load.p_filesz < load.p_memsz);
+    assert(page_end(load.p_vaddr + load.p_filesz) == page_end(load.p_vaddr + load.p_memsz));
+    // Remove only linker-generated zero padding, leaving every loaded page unchanged.
+    load.p_memsz = load.p_filesz;
+    trimmed = true;
+  }
+  assert(trimmed);
+  const int fd = memfd_create("relro-padding", MFD_CLOEXEC);
+  assert(fd >= 0 && write(fd, data, bytes) == static_cast<ssize_t>(bytes));
+  for (const bool file_backed : {false, true}) {
+    yukilinker::OpenOptions options;
+    options.native.file_backed = file_backed;
+    auto loaded = runtime.open_fd(fd, options);
+    assert(loaded && loaded.value.symbol<int (*)()>("module_answer").value() == 42);
+    const auto image = loaded.value.image();
+    assert(image);
+    uintptr_t cursor = (image.value.load_bias + relro->p_vaddr) & ~(page - 1);
+    const uintptr_t end = page_end(image.value.load_bias + relro->p_vaddr + relro->p_memsz);
+    FILE* maps = fopen("/proc/self/maps", "re");
+    assert(maps);
+    char line[4096];
+    while (cursor < end && fgets(line, sizeof(line), maps)) {
+      unsigned long long low = 0, high = 0;
+      char permissions[5]{};
+      if (sscanf(line, "%llx-%llx %4s", &low, &high, permissions) != 3 || high <= cursor) continue;
+      assert(low <= cursor && permissions[0] == 'r' && permissions[1] == '-' &&
+             permissions[2] == '-');
+      cursor = high;
+    }
+    assert(cursor >= end && !ferror(maps) && fclose(maps) == 0);
+    const auto closed = loaded.value.close();
+    assert(!closed.handle_valid() && closed.private_mapping_unmapped());
+  }
+  assert(close(fd) == 0 && munmap(data, bytes) == 0);
+  puts("PASS padded RELRO loading, constructors, page protection and unload");
+}
 #endif
 
 namespace {
@@ -107,6 +166,7 @@ extern "C" int __wrap_munmap(void* mapping, size_t bytes) {
 }
 
 extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const char* directory) {
+  exercise_relro_layouts();
   char path[4096];
   snprintf(path, sizeof(path), "%s/liblinker_module.so", directory);
   auto services = test_host_services();
@@ -136,6 +196,7 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
   puts("PASS C++ SYSTEM Core and CFI rejection");
   return 0;
 #else
+  exercise_relro_mapping(runtime, path);
   auto context_source = runtime.context(directory);
   assert(context_source);
   auto context = std::move(context_source);
