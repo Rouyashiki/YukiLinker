@@ -41,11 +41,10 @@ bool file_region_valid(size_t file_size, ElfW(Off) offset, ElfW(Xword) bytes) {
 
 bool inspect_source(const void* source, size_t file_size, SourceLayout* layout) {
   elf::Layout<ElfW(Ehdr), ElfW(Phdr)> parsed;
-  if (!elf::inspect(source, file_size, loader_page_size(), sizeof(void*) == 8 ? EM_AARCH64 : EM_ARM,
-                    &parsed)) {
+  if (!elf::inspect(source, file_size, loader_page_size(), arch::kMachine, &parsed)) {
     elf::Layout<ElfW(Ehdr), ElfW(Phdr)> small;
     if (loader_page_size() != 4096 &&
-        elf::inspect(source, file_size, 4096, sizeof(void*) == 8 ? EM_AARCH64 : EM_ARM, &small)) {
+        elf::inspect(source, file_size, 4096, arch::kMachine, &small)) {
       // A valid image whose PT_LOAD alignment is below the latched page; Bionic refuses it too
       // (without its app compat mode, which this runtime does not have).
       fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA);

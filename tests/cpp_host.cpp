@@ -25,6 +25,14 @@
 #include "host_services.h"
 #include "relro_fixture.hpp"
 
+#if (defined(__i386__) || defined(__x86_64__)) && !defined(YUKILINKER_TEST_CFI)
+#include "x86_relocations.hpp"
+#endif
+
+#if defined(YUKILINKER_TEST_X86_CALLS)
+void exercise_x86_calls(yukilinker::Runtime& runtime, const char* directory);
+#endif
+
 #if defined(YUKILINKER_TEST_NOEXCEPT)
 #if defined(__EXCEPTIONS) || defined(__GXX_RTTI)
 #error Consumer language flags were overridden
@@ -49,6 +57,12 @@ void exercise_lifecycle(yukilinker::Runtime& runtime, const char* directory) {
     int* (*slot)();
     int (*on_exit)(int*);
     int calls = 0;
+    static void* change_slot(void* opaque) {
+      int* slot = static_cast<Thread*>(opaque)->slot();
+      assert(*slot == 42);
+      *slot = 93;
+      return nullptr;
+    }
   } work{module.symbol<int* (*)()>("module_slot").value,
          module.symbol<int (*)(int*)>("module_thread_exit").value};
   int exits = 0, forks = 0;
@@ -59,7 +73,12 @@ void exercise_lifecycle(yukilinker::Runtime& runtime, const char* directory) {
              &thread, nullptr,
              [](void* opaque) -> void* {
                auto* value = static_cast<Thread*>(opaque);
-               assert(*value->slot() == 42 && value->on_exit(&value->calls) == 0);
+               int* slot = value->slot();
+               assert(*slot == 42 && value->on_exit(&value->calls) == 0);
+               *slot = 71;
+               pthread_t peer;
+               assert(pthread_create(&peer, nullptr, Thread::change_slot, value) == 0);
+               assert(pthread_join(peer, nullptr) == 0 && *value->slot() == 71);
                return nullptr;
              },
              &work) == 0);
@@ -130,6 +149,16 @@ void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* path) {
     const auto closed = loaded.value.close();
     assert(!closed.handle_valid() && closed.private_mapping_unmapped());
   }
+#if defined(__arm__) || defined(__aarch64__)
+  constexpr uint16_t foreign = sizeof(void*) == 8 ? EM_X86_64 : EM_386;
+#else
+  constexpr uint16_t foreign = sizeof(void*) == 8 ? EM_AARCH64 : EM_ARM;
+#endif
+  assert(pwrite(fd, &foreign, sizeof(foreign), offsetof(ElfW(Ehdr), e_machine)) == sizeof(foreign));
+  const auto wrong_machine = runtime.open_fd(fd);
+  assert(!wrong_machine && wrong_machine.error.code() == yukilinker::Code::InvalidElf &&
+         !wrong_machine.error.native.detail.execution_started &&
+         wrong_machine.error.native.detail.machine == header->e_machine);
   assert(close(fd) == 0 && munmap(data, bytes) == 0);
   puts("PASS padded RELRO loading, constructors, page protection and unload");
 }
@@ -196,6 +225,12 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
   puts("PASS C++ SYSTEM Core and CFI rejection");
   return 0;
 #else
+#if defined(YUKILINKER_TEST_X86_CALLS)
+  exercise_x86_calls(runtime, directory);
+#endif
+#if defined(__i386__) || defined(__x86_64__)
+  exercise_x86_relocations(runtime, directory);
+#endif
   exercise_relro_mapping(runtime, path);
   auto context_source = runtime.context(directory);
   assert(context_source);

@@ -1,14 +1,16 @@
 # YukiLinker
 
 An Android ELF loader SDK with a standalone bootstrap and a runtime embedded in
-the consuming Core. It supports ARM64 and ARM32, C callers and C++17 callers.
-SDK version is 1.0.0. The C ABI and HostServices version are 1.
+the consuming Core. It supports C and C++17 callers on Android API 31 and newer
+for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`. SDK version is 1.0.0.
+The C ABI and HostServices version are 1.
 
-| Target | ARM64 artifact | ARM32 artifact | Purpose |
+| Target | ARM64 / x86_64 artifact | ARM32 / x86 artifact | Purpose |
 | --- | --- | --- | --- |
 | `YukiLinker::bootstrap` | `libyloader64.so` | `libyloader32.so` | Load Core, transfer ownership and unload bootstrap |
 | `YukiLinker::runtime` | `libylrt64.a` | `libylrt32.a` | Complete PIC runtime linked into Core |
 
+Each ABI installs its libraries under `lib/<abi>/`.
 Include `<yukilinker.h>` for C or `<yukilinker.hpp>` for header-only C++ ownership
 wrappers. The runtime also supports direct source compilation into Core.
 

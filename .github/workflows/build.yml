@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        abi: [arm64-v8a, armeabi-v7a]
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
     steps:
       - uses: actions/checkout@v4
       - name: Install NDK
@@ -26,11 +26,13 @@ jobs:
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
       - name: Build production libraries and Native hosts
         run: |
-          cmake -S tests -B out/hosts -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-31
+          android=(-G Ninja "-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake"
+            -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-31)
+          cmake -S . -B out/sdk "${android[@]}"
+          cmake --build out/sdk --parallel 4
+          cmake --install out/sdk --prefix "$PWD/out/install"
+          cmake -S tests -B out/hosts "${android[@]}"
           cmake --build out/hosts --parallel 4
-          cmake --install out/hosts/sdk --prefix "$PWD/out/install"
       - name: Build installed and source consumers
         shell: bash
         run: |

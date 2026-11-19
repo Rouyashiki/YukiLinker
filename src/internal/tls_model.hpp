@@ -144,6 +144,10 @@ ThreadTlsState* thread_tls_state(bool* created = nullptr);
 void release_empty_thread_tls_state(ThreadTlsState* state);
 void* current_thread_tls_data(uintptr_t module_id, uintptr_t generation);
 extern "C" void* yuki_tls_get_addr(TlsIndex* index);
+#if defined(__i386__)
+// The i386 general-dynamic PLT call passes its TLS index in EAX.
+extern "C" __attribute__((regparm(1))) void* yuki_tls_get_addr_i386(TlsIndex* index);
+#endif
 bool discover_tls_segment(ImageState* image);
 
 #if defined(__aarch64__)

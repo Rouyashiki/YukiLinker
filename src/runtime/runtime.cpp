@@ -591,7 +591,7 @@ bool wait_for_thread(pthread_t first, Context* context, ImageState* caller,
     if (!waiter) break;
     owner = waiter->owner;
   }
-  uint64_t timeout = g_wait_timeout_ns;
+  uint64_t timeout = __atomic_load_n(&g_wait_timeout_ns, __ATOMIC_ACQUIRE);
   if (since && *since == kWaitAbandoned) return false;
   uint64_t start = since && *since ? *since : monotonic_ns();
   // A bound needs the clock: without it the deadline could never be found to pass.
@@ -604,7 +604,7 @@ bool wait_for_thread(pthread_t first, Context* context, ImageState* caller,
     const uint64_t now = monotonic_ns();
     if (now == 0) return refuse_without_clock();
     if (now >= end) return false;
-    // A deadline past what time_t holds (32 bits on armeabi-v7a) is no bound at all: waited for
+    // A deadline past what time_t holds (32 bits on ILP32 Android) is no bound at all: waited for
     // without one rather than wrapped into the past.
     if (end / 1000000000U > static_cast<uint64_t>(std::numeric_limits<time_t>::max())) {
       timeout = 0;

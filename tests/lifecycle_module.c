@@ -21,3 +21,15 @@ int module_fork(int* calls) {
   fork_calls = calls;
   return pthread_atfork(0, 0, child);
 }
+
+#if defined(__i386__) || defined(__x86_64__)
+typedef int (*probe_function)(void);
+static int probe_answer(void) { return 73; }
+probe_function module_x86_resolver(void) { return probe_answer; }
+int module_x86_ifunc(void) __attribute__((ifunc("module_x86_resolver")));
+extern int module_x86_weak(void) __attribute__((weak));
+// The host rewrites these five ordinary address relocations in a copy of this DSO. Android lld
+// does not emit x86_64's narrow dynamic relocations from PIC input.
+probe_function module_x86_slots[] = {module_x86_ifunc, module_x86_ifunc, module_x86_weak,
+                                     module_x86_ifunc, module_x86_ifunc};
+#endif

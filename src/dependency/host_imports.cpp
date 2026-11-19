@@ -313,11 +313,7 @@ bool type_fits(uint32_t relocation_type, unsigned symbol_type) {
   if (relocation_type == kTlsReference ||
       (symbol_type != STT_FUNC && symbol_type != STT_OBJECT && symbol_type != STT_NOTYPE))
     return false;
-#if defined(__aarch64__)
-  if (relocation_type == R_AARCH64_JUMP_SLOT) return symbol_type != STT_OBJECT;
-#else
-  if (relocation_type == R_ARM_JUMP_SLOT) return symbol_type != STT_OBJECT;
-#endif
+  if (relocation_type == arch::kJumpSlot) return symbol_type != STT_OBJECT;
   return true;
 }
 
@@ -487,11 +483,7 @@ bool maps(const CandidateSearch& search, const HostCandidate& candidate, uintptr
 Refusal placement_refusal(const CandidateSearch& search, const HostCandidate& owner,
                           uintptr_t address, uint32_t relocation_type) {
   const unsigned type = ELF64_ST_TYPE(owner.symbol.st_info);
-#if defined(__aarch64__)
-  const bool call = relocation_type == R_AARCH64_JUMP_SLOT;
-#else
-  const bool call = relocation_type == R_ARM_JUMP_SLOT;
-#endif
+  const bool call = relocation_type == arch::kJumpSlot;
   if (type == STT_FUNC || (type == STT_NOTYPE && call)) {
 #if defined(__arm__)
     // A Thumb function's value has bit 0 set.

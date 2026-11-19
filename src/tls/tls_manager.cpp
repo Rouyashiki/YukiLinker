@@ -439,6 +439,12 @@ extern "C" void* yuki_tls_get_addr(TlsIndex* index) {
   return address != nullptr ? address : tls_get_addr_slow(*index);
 }
 
+#if defined(__i386__)
+extern "C" __attribute__((regparm(1))) void* yuki_tls_get_addr_i386(TlsIndex* index) {
+  return yuki_tls_get_addr(index);
+}
+#endif
+
 void run_thread_destructor(void* opaque) {
   OperationGuard operation;
   auto* record = static_cast<ThreadExitRecord*>(opaque);

@@ -7,9 +7,15 @@ namespace yukilinker::internal {
 namespace {
 
 constexpr uint32_t kGnuProperty = 0x6474e553;
-constexpr uint32_t kFeatureAnd = 0xc0000000;
+#if defined(__arm__) || defined(__aarch64__)
+constexpr uint32_t kFeatureAnd = GNU_PROPERTY_AARCH64_FEATURE_1_AND;
+#if defined(__aarch64__)
 constexpr uint32_t kBti = 1;
 constexpr uint32_t kPac = 2;
+#endif
+#else
+constexpr uint32_t kFeatureAnd = GNU_PROPERTY_X86_FEATURE_1_AND;
+#endif
 
 uint32_t word(const uint8_t* source) {
   uint32_t value;
@@ -94,9 +100,15 @@ bool inspect_properties(const void* source, size_t file_size, SourceLayout* layo
                                    : "GNU_PROPERTY_AARCH64_FEATURE_1_AND",
                       nullptr, offset);
         layout->bti_compatible = (features & kBti) != 0;
-#else
+#elif defined(__arm__)
         if (features)
           return fail_no_errno(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_PROTECTION, offset);
+#else
+        // IBT and shadow-stack bits describe compatible code. The host selects process CET
+        // policy; loading an image must not enable either feature on the current thread.
+        if (features & ~(GNU_PROPERTY_X86_FEATURE_1_IBT | GNU_PROPERTY_X86_FEATURE_1_SHSTK))
+          return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_PROTECTION,
+                      "GNU_PROPERTY_X86_FEATURE_1_AND", nullptr, offset);
 #endif
       }
       at += static_cast<size_t>(step);

@@ -21,17 +21,25 @@ namespace yukilinker::internal {
 
 namespace {
 
-// One stub: code followed by its binding-cell address and its entry address.
-#if defined(__aarch64__)
+// Each template contains its binding-cell address and its entry address. i386 embeds
+// the two addresses as instruction immediates; the other templates use adjacent literals.
+#if defined(__aarch64__) || defined(__x86_64__)
 constexpr size_t kStubCode = 16;
 constexpr size_t kStubBytes = 32;
 constexpr size_t kGenerationAt = 16;
 constexpr size_t kEntryAt = 24;
-#else
+#elif defined(__arm__)
 constexpr size_t kStubCode = 8;
 constexpr size_t kStubBytes = 16;
 constexpr size_t kGenerationAt = 8;
 constexpr size_t kEntryAt = 12;
+#elif defined(__i386__)
+constexpr size_t kStubCode = 16;
+constexpr size_t kStubBytes = 16;
+constexpr size_t kGenerationAt = 5;
+constexpr size_t kEntryAt = 10;
+#else
+#error "Missing native caller stub layout"
 #endif
 constexpr size_t kImageStubBytes = kCallerStubs * kStubBytes;
 static_assert(sizeof(CallerStubPage) <= 4096);

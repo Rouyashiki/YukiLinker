@@ -3,6 +3,7 @@
 
 #include <type_traits>
 
+#include "../internal/elf_arch.hpp"
 #include "../internal/enumeration.hpp"
 #if defined(YUKILINKER_RUNTIME)
 #include "../internal/caller_stubs.hpp"
@@ -1177,7 +1178,7 @@ void* module_lookup_body(ImageState* caller, void* handle, const char* name, con
     // module ids a private image holds are the runtime's, and the system's function would read
     // the host's TLS for them. Other names the relocations take over stay the system's for a
     // lookup by name, as Bionic hands out its own.
-    if (name && strcmp(name, "__tls_get_addr") == 0) {
+    if (name && strcmp(name, arch::kTlsGetAddr) == 0) {
       set_dl_error(result.error);
       return module_api_symbol(name);
     }
@@ -1487,7 +1488,13 @@ void* module_api_symbol_impl(const char* name) {
   if (strcmp(name, "__cxa_thread_atexit_impl") == 0 || strcmp(name, "__cxa_thread_atexit") == 0)
     return reinterpret_cast<void*>(module_thread_atexit);
 #if YUKILINKER_FULL
-  if (strcmp(name, "__tls_get_addr") == 0) return reinterpret_cast<void*>(yuki_tls_get_addr);
+  if (strcmp(name, arch::kTlsGetAddr) == 0) {
+#if defined(__i386__)
+    return reinterpret_cast<void*>(yuki_tls_get_addr_i386);
+#else
+    return reinterpret_cast<void*>(yuki_tls_get_addr);
+#endif
+  }
   if (strcmp(name, "fork") == 0) return reinterpret_cast<void*>(module_fork);
   if (strcmp(name, "dlopen") == 0) return reinterpret_cast<void*>(module_dlopen);
   if (strcmp(name, "android_dlopen_ext") == 0)

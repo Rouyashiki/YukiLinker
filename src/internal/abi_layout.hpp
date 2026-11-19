@@ -20,7 +20,7 @@ namespace yukilinker::internal::abi_layout {
 
 #if defined(__LP64__)
 constexpr size_t kWord = 8;
-// uint64_t fields after pointer-sized ones start on an 8-byte boundary on both ABIs.
+// The v1 records align their 64-bit fields to an eight-byte boundary on every ABI.
 constexpr size_t kRecordCounters = 48;
 constexpr size_t kLookupError = 16;
 constexpr size_t kInfoGeneration = 32;
@@ -31,6 +31,13 @@ constexpr size_t kLookupError = 8;
 constexpr size_t kInfoGeneration = 16;
 #endif
 static_assert(sizeof(void*) == kWord && sizeof(size_t) == kWord && sizeof(uintptr_t) == kWord);
+static_assert(sizeof(yukilinker_c_snapshot) == 8 && alignof(yukilinker_c_snapshot) == 8);
+static_assert(sizeof(yukilinker_c_lease) == 8 && alignof(yukilinker_c_lease) == 8);
+static_assert(sizeof(yukilinker_c_native_origin) == 296 &&
+              alignof(yukilinker_c_native_origin) == 8);
+static_assert(offsetof(yukilinker_c_native_binding, origin) == 16);
+static_assert(offsetof(yukilinker_c_native_binding, completion) == 312);
+static_assert(sizeof(yukilinker_c_native_binding) == 320);
 
 static_assert(offsetof(yukilinker_c_image_id, generation) == 0);
 static_assert(offsetof(yukilinker_c_image_id, namespace_id) == 8);

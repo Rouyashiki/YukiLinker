@@ -10,7 +10,7 @@
 #include "../src/internal/elf_reader.hpp"
 
 template <typename Ehdr, typename Phdr>
-void exercise_relro_layout(size_t page) {
+void exercise_relro_layout(size_t page, uint16_t machine) {
   struct Fixture {
     Ehdr header;
     Phdr segments[5];
@@ -22,7 +22,7 @@ void exercise_relro_layout(size_t page) {
   header.e_ident[EI_VERSION] = EV_CURRENT;
   header.e_version = EV_CURRENT;
   header.e_type = ET_DYN;
-  header.e_machine = sizeof(Ehdr) == sizeof(Elf64_Ehdr) ? EM_AARCH64 : EM_ARM;
+  header.e_machine = machine;
   header.e_ehsize = sizeof(Ehdr);
   header.e_phoff = offsetof(Fixture, segments);
   header.e_phentsize = sizeof(Phdr);
@@ -105,7 +105,9 @@ void exercise_relro_layout(size_t page) {
 
 inline void exercise_relro_layouts() {
   for (const size_t page : {4096U, 16384U}) {
-    exercise_relro_layout<Elf32_Ehdr, Elf32_Phdr>(page);
-    exercise_relro_layout<Elf64_Ehdr, Elf64_Phdr>(page);
+    for (const auto machine : {EM_ARM, EM_386})
+      exercise_relro_layout<Elf32_Ehdr, Elf32_Phdr>(page, machine);
+    for (const auto machine : {EM_AARCH64, EM_X86_64})
+      exercise_relro_layout<Elf64_Ehdr, Elf64_Phdr>(page, machine);
   }
 }

@@ -17,6 +17,11 @@
 
 _Static_assert(sizeof(yukilinker_c_handle) == 16, "module handle layout");
 _Static_assert(offsetof(yukilinker_c_handle, generation) == 8, "handle generation offset");
+_Static_assert(_Alignof(yukilinker_c_handle) == 8, "module handle alignment");
+_Static_assert(sizeof(yukilinker_c_error_detail) == 552, "error detail layout");
+_Static_assert(offsetof(yukilinker_c_image_record, device) == (sizeof(void*) == 4 ? 40 : 48),
+               "image counters offset");
+_Static_assert(sizeof(yukilinker_c_close_result) == 1152, "by-value close result layout");
 _Static_assert(sizeof(yukilinker_c_early_packet_header) == 24, "packet header layout");
 _Static_assert(sizeof(yukilinker_c_early_packet_entry) == 844, "packet entry layout");
 _Static_assert(YUKILINKER_C_EARLY_PACKET_VERSION == 3, "packet wire version");

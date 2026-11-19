@@ -1,7 +1,8 @@
 # Build and integrate
 
-Use CMake 3.22 or newer, Ninja and Android NDK `30.0.16248370`. Select
-`arm64-v8a` or `armeabi-v7a` and an Android API31 toolchain.
+Use CMake 3.22 or newer, Ninja and Android NDK `30.0.16248370`. Configure at
+API 31 with `arm64-v8a`, `armeabi-v7a`, `x86` or `x86_64`, using a separate build
+directory for each ABI.
 
 ```sh
 cmake -S . -B out/arm64 -G Ninja \
@@ -12,8 +13,9 @@ cmake --install out/arm64 --prefix "$PWD/out/install"
 ```
 
 Each ABI installs two production libraries under `lib/<abi>/`. The public
-headers are directly under `include/`. Both ABIs can share an installation
-prefix because exported CMake targets use separate ABI directories.
+headers are directly under `include/`. All four ABIs can share an installation
+prefix because exported CMake targets use separate ABI directories. The library
+filename suffix gives the pointer width. The ABI directory identifies the instruction set.
 
 ## Archive consumption
 
@@ -75,6 +77,6 @@ Set `YUKILINKER_RUNTIME_FORM=archive|sources` and
 consumer with `bootstrap_host --system <absolute-core.so> <fixtures>` to check
 Core unloading followed by fork and process-exit cleanup.
 
-CI builds both ABIs, installs the SDK and compiles the Native hosts and consumers.
+CI builds all four ABIs, installs the SDK and compiles the Native hosts and consumers.
 Local QEMU execution needs a provisioned Bionic runtime. The NDK supplies link
 stubs for compilation, so provision executable Bionic libraries separately.

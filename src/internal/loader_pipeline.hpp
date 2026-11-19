@@ -81,6 +81,7 @@ bool walk_handle_scope(ImageState* root, bool (*visit)(ImageState*, void*), void
 constexpr uint32_t kTlsReference = UINT32_MAX;
 SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocation_type);
 SymbolResolution resolve_symbol(ImageState* image, uint32_t index, const SymbolTarget& target);
+size_t relocation_width(uint32_t type);
 bool relocate_image(ImageState* image);
 bool validate_hwasan_globals(ImageState* image);
 bool register_hwasan_globals(ImageState* image);
@@ -130,7 +131,7 @@ bool wait_for_load(const ImageState* image, Context* context, ImageState* caller
 // collection when it frees or keeps an image an open may wait for.
 void notify_load_waiters();
 // How long wait_for_thread waits before it gives up (0: no bound), in nanoseconds.
-extern uint64_t g_wait_timeout_ns;
+alignas(8) extern uint64_t g_wait_timeout_ns;
 
 // The threads that load a root open or wait for another thread, for load_waits: a fixed table
 // each thread writes only its own slot of, under a sequence number (odd while it is written), so a
@@ -141,9 +142,10 @@ struct WaitSlot {
   int32_t thread;
   uint32_t kind;
   int32_t owner;
-  uint64_t generation;
-  uint64_t namespace_id;
-  uint64_t start_ns;
+  // i386 needs explicit eight-byte alignment for lock-free 64-bit atomics.
+  alignas(8) uint64_t generation;
+  alignas(8) uint64_t namespace_id;
+  alignas(8) uint64_t start_ns;
 };
 extern WaitSlot g_wait_slots[kWaitSlots];
 // Loads and waits that found no free slot, counted while they last. Each is also listed by its

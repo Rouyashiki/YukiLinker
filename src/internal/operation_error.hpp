@@ -11,6 +11,7 @@
 
 #include "../../include/yukilinker.h"
 #include "config.hpp"
+#include "elf_arch.hpp"
 #include "loader_types.hpp"
 
 namespace yukilinker::internal {
@@ -47,7 +48,7 @@ static inline bool fail(uint32_t code, uint32_t stage, const char* symbol = null
     error.code = code;
     error.stage = stage;
     error.system_errno = errno_derived(code) ? errno : 0;
-    error.machine = sizeof(void*) == 8 ? EM_AARCH64 : EM_ARM;
+    error.machine = arch::kMachine;
     error.offset = offset;
     error.relocation_type = type;
     if (symbol) (void)snprintf(error.symbol, sizeof(error.symbol), "%s", symbol);

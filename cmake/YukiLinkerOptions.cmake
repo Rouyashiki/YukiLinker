@@ -4,7 +4,7 @@
 option(YUKILINKER_BUILD_BOOTSTRAP "Build the Core bootstrap loader" ON)
 option(YUKILINKER_CFI "Instrument the Core runtime with cross-DSO CFI" OFF)
 set(YUKILINKER_SANITIZER "" CACHE STRING "Optional NDK sanitizer")
-set(YUKILINKER_SUPPORTED_ABIS arm64-v8a armeabi-v7a)
+set(YUKILINKER_SUPPORTED_ABIS arm64-v8a armeabi-v7a x86 x86_64)
 set_property(CACHE YUKILINKER_SANITIZER PROPERTY STRINGS "" address hwaddress undefined thread)
 set(_yukilinker_sanitizers address hwaddress undefined thread)
 if(NOT YUKILINKER_SANITIZER STREQUAL "" AND

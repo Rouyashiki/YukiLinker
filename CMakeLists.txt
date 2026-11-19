@@ -29,10 +29,8 @@ endif()
 include(cmake/YukiLinkerTargets.cmake)
 
 include(GNUInstallDirs)
-# Both ABIs install into one prefix: libraries and exported targets go to per-ABI directories,
-# so the second install does not replace the first one's targets file. The key is the one
-# cmake/YukiLinkerTargets.cmake selects sources with; CMake's own Android platform does not set
-# ANDROID_ABI, and an empty key would let the two ABIs overwrite each other.
+# Libraries and exported targets use the same ABI key as source selection so all four
+# installations can share a prefix. CMake's own Android platform does not set ANDROID_ABI.
 if(NOT CMAKE_ANDROID_ARCH_ABI)
   message(FATAL_ERROR "YukiLinker install needs CMAKE_ANDROID_ARCH_ABI")
 endif()
@@ -54,7 +52,7 @@ install(EXPORT YukiLinkerTargets NAMESPACE YukiLinker::
 # install(EXPORT) alone writes only the targets file; without this config
 # find_package(YukiLinker) has nothing to find. The config is the same for every ABI and picks
 # the consumer's ABI. The version file lets a consumer ask for a compatible major version; it is
-# ARCH_INDEPENDENT because both ABIs share it (the default would reject the other pointer size).
+# ARCH_INDEPENDENT because all ABIs share it (the default would reject the other pointer size).
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/YukiLinkerConfig.cmake.in
@@ -66,8 +64,7 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion
   ARCH_INDEPENDENT)
 # CMake's template still writes the producer's pointer size into the check that ARCH_INDEPENDENT
-# skips (an early return() precedes it), so the two ABIs' files differ in dead code. Both install
-# to one place; the check is dropped here so either ABI writes the same file.
+# skips (an early return() precedes it). Drop that dead code so every ABI installs the same file.
 file(READ ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake YUKILINKER_VERSION_FILE)
 string(FIND "${YUKILINKER_VERSION_FILE}" "# if the installed or the using project don't have"
        YUKILINKER_ARCH_CHECK)

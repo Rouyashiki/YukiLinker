@@ -21,9 +21,12 @@ uintptr_t invoke_ifunc(ImageState* image, uintptr_t resolver) {
   arguments._size = offsetof(__ifunc_arg_t, _hwcap2) + sizeof(arguments._hwcap2);
   return call_module(resolver, arguments._hwcap | _IFUNC_ARG_HWCAP,
                      reinterpret_cast<uintptr_t>(&arguments));
-#else
+#elif defined(__arm__)
   // Bionic's arm32 resolvers take AT_HWCAP.
   return call_module(resolver, getauxval(AT_HWCAP), 0);
+#else
+  // Bionic's i386 and x86-64 resolvers take no arguments.
+  return call_module(resolver, 0, 0);
 #endif  // #if defined(__aarch64__)
 }
 
@@ -271,7 +274,7 @@ SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocatio
     // An image of a managed namespace calls these through its own stubs, which name it.
     if (void* stub = caller_stub_for(image, name)) return {nullptr, nullptr, stub, true};
 #endif
-    if (!image->host || strcmp(name, "__tls_get_addr") == 0)
+    if (!image->host || strcmp(name, arch::kTlsGetAddr) == 0)
       if (void* replacement = module_api_symbol(name)) return {nullptr, nullptr, replacement, true};
   }
   auto target = search_scope(image->load_root ? image->load_root : image, name, version,
@@ -450,15 +453,15 @@ uint32_t relocation_symbol(const ElfRelocation& relocation) {
 #endif  // #if defined(__LP64__)
 }
 
-ElfW(Sxword) relocation_addend(const ElfRelocation& relocation, ElfW(Addr) value) {
+ElfW(Sxword) relocation_addend(const ElfRelocation& relocation, const void* destination) {
 #if defined(__LP64__)
-  (void)value;
+  (void)destination;
   return relocation.r_addend;
 #else
   // The word in place, as the system linker reads it: its bits, which apply_addend adds in the
   // address width. A TLS offset reads it as a signed value, but only within its block.
   (void)relocation;
-  return static_cast<ElfW(Sword)>(value);
+  return static_cast<ElfW(Sword)>(load_word(destination));
 #endif  // #if defined(__LP64__)
 }
 
@@ -527,32 +530,54 @@ uintptr_t writable_end(const ImageState* image) {
   return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS, nullptr, nullptr, address, type);
 }
 
-// Relocation types whose value is the target symbol's address.
-bool symbol_value_type(uint32_t type) {
-#if defined(__aarch64__)
-  return type == R_AARCH64_ABS64 || type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT;
+bool pc_relative(uint32_t type) {
+#if defined(__arm__)
+  return type == R_ARM_REL32;
+#elif defined(__i386__)
+  return type == R_386_PC32;
+#elif defined(__x86_64__)
+  return type == R_X86_64_PC32;
 #else
-  return type == R_ARM_ABS32 || type == R_ARM_REL32 || type == R_ARM_GLOB_DAT ||
-         type == R_ARM_JUMP_SLOT;
+  (void)type;
+  return false;
 #endif
 }
 
-// Stores a resolved symbol address the way a symbol_value_type relocation asks for. The sum wraps
-// in the address width, as the system linker's does.
-bool write_symbol_value(uint32_t type, void* destination, uintptr_t address, ElfW(Sxword) addend) {
-#if defined(__aarch64__)
-  (void)type;
-  store_word(destination, apply_addend(address, addend));
+size_t relocation_width(uint32_t type) {
+#if defined(__x86_64__)
+  if (type == R_X86_64_32 || type == R_X86_64_PC32) return sizeof(uint32_t);
+#elif defined(__aarch64__)
+  if (type == R_AARCH64_TLSDESC) return 2 * sizeof(ElfW(Addr));
 #else
-  if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT) {
-    store_word(destination, address);
-    return true;
-  }
-  uintptr_t value = apply_addend(address, addend);
-  if (type == R_ARM_REL32) value -= reinterpret_cast<uintptr_t>(destination);
-  store_word(destination, value);
+  (void)type;
 #endif
-  return true;
+  return sizeof(ElfW(Addr));
+}
+
+bool symbol_value_type(uint32_t type) {
+#if defined(__x86_64__)
+  if (type == R_X86_64_32) return true;
+#endif
+  return type == arch::kAbsolute || type == arch::kGlobDat || type == arch::kJumpSlot ||
+         pc_relative(type);
+}
+
+// RELA GLOB_DAT/JUMP_SLOT take the explicit addend. Bionic ignores the GOT contents for REL.
+void write_symbol_value(uint32_t type, void* destination, uintptr_t address, ElfW(Sxword) addend) {
+#if !defined(__LP64__)
+  if (type == arch::kGlobDat || type == arch::kJumpSlot) addend = 0;
+#endif
+  uintptr_t value = apply_addend(address, addend);
+  if (pc_relative(type)) value -= reinterpret_cast<uintptr_t>(destination);
+#if defined(__x86_64__)
+  // Bionic stores the low 32 bits for both types, including an unaligned data member.
+  if (relocation_width(type) == sizeof(uint32_t)) {
+    const uint32_t narrow = static_cast<uint32_t>(value);
+    memcpy(destination, &narrow, sizeof(narrow));
+    return;
+  }
+#endif
+  store_word(destination, value);
 }
 
 bool defer_relocation(ImageState* image, const DeferredRelocation& entry) {
@@ -587,7 +612,7 @@ bool replay_deferred_relocations(ImageState* image) {
   const auto& set = image->relocations;
   for (size_t i = 0; i < set.deferred_count; ++i) {
     const DeferredRelocation entry = set.deferred[i];
-    void* destination = relocation_destination(image, entry.offset);
+    void* destination = relocation_destination(image, entry.offset, relocation_width(entry.type));
     if (destination == nullptr) return false;
     if (entry.provider == nullptr) {
       // The resolver's address wraps as the system linker's does; it must be the image's code.
@@ -601,9 +626,8 @@ bool replay_deferred_relocations(ImageState* image) {
     }
     if (!provider_retained(image, entry.provider)) return false;
     const SymbolResolution resolution = materialize_defined_symbol(entry.provider, *entry.symbol);
-    if (!resolution.valid ||
-        !write_symbol_value(entry.type, destination, resolution.address, entry.addend))
-      return false;
+    if (!resolution.valid) return false;
+    write_symbol_value(entry.type, destination, resolution.address, entry.addend);
   }
   return true;
 }
@@ -619,7 +643,8 @@ void discard_deferred_relocations(ImageState* image) {
 // adjacent, and the system linker keeps the same one-entry cache. It lives on relocate_image's
 // stack, and a TLS lookup, the only other thing in pass 1 that can drop the lock, empties it.
 struct LookupCache {
-  uint32_t index = 0;  // 0 is empty: STN_UNDEF is never looked up.
+  uint32_t index = 0;      // 0 is empty: STN_UNDEF is never looked up.
+  bool jump_slot = false;  // A host object valid for an address relocation cannot satisfy a call.
   SymbolTarget target;
 };
 
@@ -627,40 +652,34 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
   uint32_t type = relocation_type(relocation);
   uint32_t symbol_index = relocation_symbol(relocation);
   if (type == 0) return true;
-  size_t width = sizeof(ElfW(Addr));
 #if defined(__aarch64__)
-  // A TLS descriptor is two words; both are checked before either is recorded or written.
-  if (type == R_AARCH64_TLSDESC) width *= 2;
   // AAELF64 leaves these two numbers to the platform. Old Android and current
   // NDK headers disagree; a strict PRIVATE context never guesses from the device API.
   if (image->context->strict_private && (type == 1028 || type == 1029))
     return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, "AArch64 TLS_IMPDEF", nullptr,
                 relocation.r_offset, type);
 #endif
+  const bool indirect = type == arch::kIRelative;
+  const bool static_tls = type == arch::kTpOff;
+  bool tls = type == arch::kDtpMod || type == arch::kDtpOff;
+#if defined(__aarch64__)
+  tls = tls || static_tls || type == R_AARCH64_TLSDESC;
+#elif YUKILINKER_FULL
+  tls = tls || static_tls;
+#endif
+  const bool supported = type == arch::kRelative || indirect || tls || symbol_value_type(type);
+
+  if (!supported)
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
+                relocation.r_offset, type);
+  // Only a supported encoding has a known operand width.
+  const size_t width = relocation_width(type);
   void* destination = relocation_destination(image, relocation.r_offset, width);
   if (destination == nullptr)
     return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
                 relocation.r_offset, type);
   if (!record_relocation_target(image, relocation.r_offset, width, type)) return false;
-  ElfW(Sxword) addend = relocation_addend(relocation, load_word(destination));
-#if defined(__aarch64__)
-  const bool indirect = type == R_AARCH64_IRELATIVE;
-  const bool static_tls = type == R_AARCH64_TLS_TPREL64;
-  const bool tls = type >= R_AARCH64_TLS_DTPREL64 && type <= R_AARCH64_TLSDESC;
-  const bool supported = type == R_AARCH64_RELATIVE || indirect || tls || type == R_AARCH64_ABS64 ||
-                         type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT;
-#else
-  const bool indirect = type == R_ARM_IRELATIVE;
-  // The reduced loader has no TLS; it keeps refusing initial-exec TLS as an unknown type.
-  const bool static_tls = YUKILINKER_FULL && type == R_ARM_TLS_TPOFF32;
-  const bool tls = type == R_ARM_TLS_DTPMOD32 || type == R_ARM_TLS_DTPOFF32 || static_tls;
-  // R_ARM_TLS_DESC is refused, as the system linker refuses it on ARM32.
-  const bool supported = type == R_ARM_RELATIVE || indirect || tls || type == R_ARM_ABS32 ||
-                         type == R_ARM_REL32 || type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT;
-#endif
-  if (!supported)
-    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
-                relocation.r_offset, type);
+  const ElfW(Sxword) addend = relocation_addend(relocation, destination);
   if (g_relocation_pass == -1) {
     if (tls) image->relocations.tls = true;
     const auto* symbol = symbol_at(image, symbol_index);
@@ -676,7 +695,9 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
 #if YUKILINKER_FULL
     if (tls) {
       TlsReference reference;
-      if (!resolve_tls_reference(image, symbol_index, addend, &reference)) {
+      // A module-id relocation ignores its addend, including the initial GOT word in REL.
+      const auto tls_addend = type == arch::kDtpMod ? 0 : addend;
+      if (!resolve_tls_reference(image, symbol_index, tls_addend, &reference)) {
         name_relocation(relocation.r_offset, type);
         return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
                     relocation.r_offset, type);
@@ -695,7 +716,8 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
   if (symbol_index && !tls) {
     // Nothing dropped the lock since the entry was filled. A private provider must still be
     // pinned by this image's edge, the check pass 2 makes.
-    if (symbol_index == cache->index &&
+    const bool jump_slot = type == arch::kJumpSlot;
+    if (symbol_index == cache->index && jump_slot == cache->jump_slot &&
         (!cache->target.image || provider_retained(image, cache->target.image))) {
       target = cache->target;
     } else {
@@ -711,7 +733,7 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
                     import ? symbol_version(image, symbol_index, true) : nullptr,
                     relocation.r_offset, type);
       }
-      *cache = {symbol_index, target};
+      *cache = {symbol_index, jump_slot, target};
     }
   }
   // Pass 1 writes everything that runs no code and records the rest for pass 2.
@@ -722,16 +744,24 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
     return defer_relocation(image,
                             {relocation.r_offset, addend, target.image, target.symbol, type});
 
-#if defined(__aarch64__)
+  if (symbol_value_type(type)) {
+    auto symbol = resolve_symbol(image, symbol_index, target);
+    if (!symbol.valid) return false;
+#if defined(__i386__) || defined(__x86_64__)
+    // Bionic uses P as S for an unresolved weak PC32, leaving exactly the addend in the slot.
+    if (symbol_index && !target.found && pc_relative(type))
+      symbol.address = reinterpret_cast<uintptr_t>(destination);
+#endif
+    write_symbol_value(type, destination, symbol.address, addend);
+    return true;
+  }
   switch (type) {
-    case R_AARCH64_NONE:
-      return true;
-    case R_AARCH64_RELATIVE: {
+    case arch::kRelative:
       store_word(destination,
                  apply_addend(reinterpret_cast<uintptr_t>(image->memory.bias), addend));
       return true;
-    }
 #if YUKILINKER_FULL
+#if defined(__aarch64__)
     case R_AARCH64_TLSDESC: {
       TlsReference reference;
       if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
@@ -750,89 +780,30 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
       store_word(argument, reinterpret_cast<uintptr_t>(cookie));
       return true;
     }
-    case R_AARCH64_TLS_DTPREL64: {
-      TlsReference reference;
-      if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
-      store_word(destination, reference.byte_offset);
-      return true;
-    }
-    case R_AARCH64_TLS_DTPMOD64: {
+#endif
+    case arch::kDtpMod: {
       TlsReference reference;
       if (!resolve_tls_reference(image, symbol_index, 0, &reference)) return false;
       store_word(destination, reference.unresolved_weak ? 0 : reference.module_id);
       return true;
     }
-    case R_AARCH64_TLS_TPREL64: {
+    case arch::kDtpOff:
+    case arch::kTpOff: {
       TlsReference reference;
       if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
-      if (reference.unresolved_weak) {
-        store_word(destination, reference.byte_offset);
-        return true;
-      }
-      // Pass 0 saw it unresolved; the scope changed while a lookup dropped the lock.
-      host_log_error("yukilinker: static TLS access model is unsupported");
-      return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
-                  relocation.r_offset, type);
-    }
-#endif  // #if YUKILINKER_FULL
-    case R_AARCH64_ABS64:
-    case R_AARCH64_GLOB_DAT:
-    case R_AARCH64_JUMP_SLOT: {
-      SymbolResolution symbol = resolve_symbol(image, symbol_index, target);
-      return symbol.valid && write_symbol_value(type, destination, symbol.address, addend);
-    }
-    default:
-      host_log_error("yukilinker: unsupported AArch64 relocation %u", type);
-      return false;
-  }
-#else
-  switch (type) {
-    case R_ARM_NONE:
-      return true;
-    case R_ARM_RELATIVE: {
-      store_word(destination,
-                 apply_addend(reinterpret_cast<uintptr_t>(image->memory.bias), addend));
-      return true;
-    }
-    case R_ARM_ABS32:
-    case R_ARM_REL32:
-    case R_ARM_GLOB_DAT:
-    case R_ARM_JUMP_SLOT: {
-      SymbolResolution symbol = resolve_symbol(image, symbol_index, target);
-      return symbol.valid && write_symbol_value(type, destination, symbol.address, addend);
-    }
-#if YUKILINKER_FULL
-    case R_ARM_TLS_DTPMOD32: {
-      TlsReference reference;
-      if (!resolve_tls_reference(image, symbol_index, 0, &reference)) return false;
-      store_word(destination, reference.unresolved_weak ? 0 : reference.module_id);
-      return true;
-    }
-    case R_ARM_TLS_DTPOFF32: {
-      TlsReference reference;
-      if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
+      // A weak static reference seen unresolved in pass 0 can acquire a provider while the
+      // lookup drops the lock. Its dynamic block still has no static thread-pointer offset.
+      if (type == arch::kTpOff && !reference.unresolved_weak)
+        return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
+                    relocation.r_offset, type);
       store_word(destination, reference.byte_offset);
       return true;
     }
-    case R_ARM_TLS_TPOFF32: {
-      TlsReference reference;
-      if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
-      if (reference.unresolved_weak) {
-        // The in-place addend, as on AArch64.
-        store_word(destination, reference.byte_offset);
-        return true;
-      }
-      // Pass 0 saw it unresolved; the scope changed while a lookup dropped the lock.
-      host_log_error("yukilinker: ARM static TLS access model is unsupported");
+#endif
+    default:
       return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
                   relocation.r_offset, type);
-    }
-#endif  // #if YUKILINKER_FULL
-    default:
-      host_log_error("yukilinker: unsupported ARM relocation %u", type);
-      return false;
   }
-#endif  // #if defined(__aarch64__)
 }
 
 bool apply_relocation_span(ImageState* image, const ElfRelocation* entries, size_t bytes,
@@ -846,16 +817,11 @@ bool apply_relocation_span(ImageState* image, const ElfRelocation* entries, size
 }
 
 bool patch_relative_word(ImageState* image, ElfW(Addr) offset) {
-#if defined(__aarch64__)
-  constexpr uint32_t kRelative = R_AARCH64_RELATIVE;
-#else
-  constexpr uint32_t kRelative = R_ARM_RELATIVE;
-#endif
   void* word = relocation_destination(image, offset);
   if (word == nullptr)
     return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS, nullptr, nullptr, offset,
-                kRelative);
-  if (!record_relocation_target(image, offset, sizeof(ElfW(Addr)), kRelative)) return false;
+                arch::kRelative);
+  if (!record_relocation_target(image, offset, sizeof(ElfW(Addr)), arch::kRelative)) return false;
   if (g_relocation_pass == 1)
     store_word(word, load_word(word) + reinterpret_cast<uintptr_t>(image->memory.bias));
   return true;

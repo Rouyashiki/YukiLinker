@@ -65,7 +65,6 @@ bool metadata_target(ImageState* image, uintptr_t at, size_t bytes, uintptr_t de
 bool validate_hwasan_globals(ImageState* image) {
   auto& memory = image->memory;
   bool found = false;
-  const uintptr_t bias = reinterpret_cast<uintptr_t>(memory.bias);
   for (size_t i = 0; i < memory.program_header_count; ++i) {
     const auto& ph = memory.program_headers[i];
     if (ph.p_type != PT_NOTE || !ph.p_memsz) continue;
@@ -97,10 +96,13 @@ bool validate_hwasan_globals(ImageState* image) {
             end < begin || begin % 4 || (end - begin) % 8 ||
             (end != begin && !readable(image, begin, end - begin)))
           return invalid_note(at);
+#if defined(__LP64__)
+        const uintptr_t bias = reinterpret_cast<uintptr_t>(memory.bias);
         if (end != begin && (memory.span > (uint64_t{1} << 32) || bias > (uint64_t{1} << 48) ||
                              memory.lowest_vaddr > (uint64_t{1} << 48) - bias ||
                              memory.span > (uint64_t{1} << 48) - bias - memory.lowest_vaddr))
           return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, "HWASan code model");
+#endif
         for (uintptr_t entry = begin; entry < end; entry += 8) {
           int32_t relative;
           memcpy(&relative, memory.bias + entry, 4);
@@ -116,11 +118,12 @@ bool validate_hwasan_globals(ImageState* image) {
             return invalid_note(entry);
           // A deferred write through an untagged loader pointer cannot target
           // an already tagged global. Reject that combination before resolvers.
-          for (size_t j = 0; j < image->relocations.deferred_count; ++j)
-            if (overlaps(target, rounded, image->relocations.deferred[j].offset,
-                         sizeof(ElfW(Addr))))
+          for (size_t j = 0; j < image->relocations.deferred_count; ++j) {
+            const auto& write = image->relocations.deferred[j];
+            if (overlaps(target, rounded, write.offset, relocation_width(write.type)))
               return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS,
                           "HWASan tagged IFUNC destination");
+          }
           // The compiler stores a short global's tag in its final granule byte.
           if (bytes % 16 && memory.bias[target + rounded - 1] != (info >> 24))
             return invalid_note(entry);

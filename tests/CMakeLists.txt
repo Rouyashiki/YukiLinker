@@ -35,6 +35,18 @@ add_executable(cpp_host cpp_host.cpp)
 target_link_libraries(cpp_host PRIVATE YukiLinker::runtime dl)
 target_compile_options(cpp_host PRIVATE -UNDEBUG)
 target_link_options(cpp_host PRIVATE -Wl,--wrap=munmap)
+if(CMAKE_ANDROID_ARCH_ABI MATCHES "^x86(_64)?$" AND NOT YUKILINKER_CFI)
+  # The narrow relocation test rewrites symbol relocations in ordinary REL/RELA tables.
+  target_link_options(linker_lifecycle PRIVATE -Wl,--pack-dyn-relocs=relr)
+  add_library(linker_x86_calls SHARED x86_call_module.c)
+  target_link_libraries(linker_x86_calls PRIVATE dl)
+  # Exercise the packed tables on a module with both address and symbol relocations.
+  target_link_options(linker_x86_calls PRIVATE -Wl,-z,max-page-size=16384
+    -Wl,--pack-dyn-relocs=android+relr)
+  target_sources(cpp_host PRIVATE x86_calls.cpp)
+  target_compile_definitions(cpp_host PRIVATE YUKILINKER_TEST_X86_CALLS=1)
+  add_dependencies(cpp_host linker_x86_calls)
+endif()
 foreach(host c_host cpp_host)
   if(YUKILINKER_CFI)
     target_compile_definitions(${host} PRIVATE YUKILINKER_TEST_CFI=1)

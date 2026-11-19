@@ -30,11 +30,21 @@ extern "C" {
 typedef struct yukilinker_c_runtime yukilinker_c_runtime;
 typedef struct yukilinker_c_context yukilinker_c_context;
 typedef struct yukilinker_c_namespace yukilinker_c_namespace;
+
+/* The v1 records use the same layout on both 32-bit Android ABIs. i386 naturally
+ * aligns a uint64_t member to four bytes; align the fields that establish an
+ * eight-byte boundary or the alignment of their enclosing record. */
+#if defined(__i386__)
+#define YUKILINKER_ALIGN8 __attribute__((aligned(8)))
+#else
+#define YUKILINKER_ALIGN8
+#endif
+
 typedef struct yukilinker_c_snapshot {
-  uint64_t value;
+  YUKILINKER_ALIGN8 uint64_t value;
 } yukilinker_c_snapshot;
 typedef struct yukilinker_c_lease {
-  uint64_t value;
+  YUKILINKER_ALIGN8 uint64_t value;
 } yukilinker_c_lease;
 
 enum yukilinker_c_error_code {
@@ -77,7 +87,7 @@ typedef struct yukilinker_c_error_detail {
   uint32_t stage;
   int32_t system_errno;
   uint32_t relocation_type;
-  uint64_t offset;
+  YUKILINKER_ALIGN8 uint64_t offset;
   uint32_t machine;
   uint32_t execution_started;
   uint32_t cleanup_incomplete;
@@ -95,7 +105,7 @@ typedef struct yukilinker_c_image_info {
   uintptr_t mapping_start;
   size_t mapping_size;
   const char* name;
-  uint64_t generation;
+  YUKILINKER_ALIGN8 uint64_t generation;
 } yukilinker_c_image_info;
 
 typedef int (*yukilinker_c_image_visitor)(const yukilinker_c_image_info*, void*);
@@ -157,7 +167,7 @@ enum yukilinker_c_lease_kind {
 };
 
 typedef struct yukilinker_c_image_id {
-  uint64_t generation;
+  YUKILINKER_ALIGN8 uint64_t generation;
   uint64_t namespace_id;
 } yukilinker_c_image_id;
 
@@ -171,7 +181,7 @@ typedef struct yukilinker_c_image_record {
   uintptr_t load_bias;
   uintptr_t mapping_start;
   size_t mapping_size;
-  uint64_t device;
+  YUKILINKER_ALIGN8 uint64_t device;
   uint64_t inode;
   uint64_t source_offset;
   uint64_t flags;
@@ -210,7 +220,7 @@ enum yukilinker_c_mapping_flag {
 typedef struct yukilinker_c_mapping_record {
   uint32_t size;
   uint32_t flags;
-  uint64_t relro_written_bytes;
+  YUKILINKER_ALIGN8 uint64_t relro_written_bytes;
   uint64_t relro_shared_bytes;
 } yukilinker_c_mapping_record;
 
@@ -241,7 +251,7 @@ enum yukilinker_c_image_detail_flag {
 
 /* A copied view of one image. The caller sets size to the bytes it provides; the runtime writes
  * the largest known version that fits and stores the number of bytes written in size. Addresses
- * are 64-bit on both ABIs. The 128-byte layout below is version 1 and is frozen; a later version
+ * are 64-bit on every ABI. The 128-byte layout below is version 1 and is frozen; a later version
  * only appends fields. Such a version is a new struct of its own (this one stays 128 bytes, so a
  * caller built against this header always provides 128 and gets version 1), and a caller of it
  * that provides more bytes reads size to see how many were written. A size below 128 is refused,
@@ -309,7 +319,7 @@ typedef struct yukilinker_c_namespace_link_record {
   uint32_t flags;
   uint32_t reserved;
   /* The target namespace's id; 0 exactly when flags has YUKILINKER_C_NAMESPACE_LINK_SYSTEM. */
-  uint64_t target_namespace_id;
+  YUKILINKER_ALIGN8 uint64_t target_namespace_id;
   /* The ':'-separated sonames the link shares, as given; empty with
    * YUKILINKER_C_NAMESPACE_LINK_ALL. */
   char shared_sonames[4096];
@@ -457,7 +467,7 @@ typedef struct yukilinker_c_host_services {
 /* Both words are opaque. Carry them together with the owner; do not interpret
  * slot as an array index. A handle from a different owner/Core is rejected. */
 typedef struct yukilinker_c_handle {
-  uint64_t slot;
+  YUKILINKER_ALIGN8 uint64_t slot;
   uint64_t generation;
 } yukilinker_c_handle;
 
@@ -551,7 +561,7 @@ typedef struct yukilinker_c_close_result {
 typedef struct yukilinker_c_runtime_stats {
   uint32_t size;
   uint32_t handle_limit;
-  uint64_t handles;
+  YUKILINKER_ALIGN8 uint64_t handles;
   uint64_t uncertain_handles;
   uint64_t pending_operations;
   uint64_t handle_bytes;
@@ -596,9 +606,11 @@ void yuki_bootstrap_tango(uint32_t got, uint32_t original, uint32_t stub, int co
 #define YUKILINKER_C_NATIVE_BOOTSTRAP_VERSION 1U
 typedef struct yukilinker_c_native_origin {
   uint32_t size, version, process, generation;
-  uint64_t linker_base, libc_base, libc_anchor;
+  YUKILINKER_ALIGN8 uint64_t linker_base;
+  uint64_t libc_base, libc_anchor;
   char libc_path[256];
 } yukilinker_c_native_origin;
+#undef YUKILINKER_ALIGN8
 #define YUKILINKER_C_NATIVE_LOADER_RETAINED 1U
 #define YUKILINKER_C_NATIVE_LOADER_ADOPTED 2U
 #define YUKILINKER_C_NATIVE_LOADER_RETURNED 4U
