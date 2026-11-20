@@ -495,7 +495,7 @@ void unlock_after_fork(int child) {
     const uintptr_t depth = operation_depth();
     const auto recovered = recover_android_fork_mutex(&g_operation_mutex, depth);
     // Every waiting open was another thread's, and the child has none of them.
-    pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t idle = PTHREAD_COND_INITIALIZER_MONOTONIC_NP;
     memcpy(&g_load_wait_cond, &idle, sizeof(idle));
     for (auto* waiter = g_load_waiters; waiter; waiter = waiter->next)
       if (waiter->context) --waiter->context->waiting_opens;

@@ -5,6 +5,11 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -105,26 +110,42 @@ extern bool g_tls_stopped;
 
 // Blocks, for a TLS critical section, every signal a caller may block except the synchronous
 // faults: a handler on this thread then runs only after the scope, so it never finds g_tls_mutex
-// held or this thread's TLS state half changed. pthread_sigmask64 leaves Bionic's reserved
-// signals deliverable. Faults stay deliverable because the kernel would force a blocked one to
+// held or this thread's TLS state half changed. Leave Bionic's reserved signals alone.
+// Faults stay deliverable because the kernel would force a blocked one to
 // its default action, past every handler.
 struct ScopedSignalBlocker {
-  sigset64_t old{};
-  bool blocked = false;
   ScopedSignalBlocker() {
+    // The kernel numbers signals from one. The first application RT signal is a
+    // property of the running Bionic, which reserves some of the low RT signals.
+    constexpr uint64_t ordinary = (uint64_t{1} << (__SIGRTMIN - 1)) - 1;
+    const int rt_min = SIGRTMIN;
+    const int rt_max = SIGRTMAX;
+    const uint64_t realtime =
+        rt_min >= 1 && rt_max <= 64 && rt_min <= rt_max
+            ? (UINT64_MAX << (rt_min - 1)) & (UINT64_MAX >> (64 - rt_max))
+            : 0;
+    uint64_t bits = ordinary | realtime;
+    constexpr int faults[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS};
+    for (int fault : faults) bits &= ~(uint64_t{1} << (fault - 1));
     sigset64_t set;
-    sigfillset64(&set);
-    constexpr int kFaults[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS};
-    for (int fault : kFaults) sigdelset64(&set, fault);
-    blocked = pthread_sigmask64(SIG_BLOCK, &set, &old) == 0;
+    static_assert(sizeof(set) == sizeof(bits));
+    memcpy(&set, &bits, sizeof(set));
+    change_mask(SIG_BLOCK, &set, &old);
   }
-  ~ScopedSignalBlocker() {
-    if (blocked) (void)pthread_sigmask64(SIG_SETMASK, &old, nullptr);
-  }
+  ~ScopedSignalBlocker() { change_mask(SIG_SETMASK, &old, nullptr); }
   ScopedSignalBlocker(const ScopedSignalBlocker&) = delete;
   ScopedSignalBlocker& operator=(const ScopedSignalBlocker&) = delete;
   ScopedSignalBlocker(ScopedSignalBlocker&&) = delete;
   ScopedSignalBlocker& operator=(ScopedSignalBlocker&&) = delete;
+
+ private:
+  sigset64_t old;
+  static void change_mask(int how, const sigset64_t* set, sigset64_t* previous) {
+    // The kernel accepts the full mask on both pointer widths. Oreo's 32-bit
+    // pthread_sigmask truncates it, and newer libc wrappers can change the
+    // reserved timer bit on restore. Restore exactly what this thread had.
+    if (syscall(SYS_rt_sigprocmask, how, set, previous, sizeof(*set)) != 0) abort();
+  }
 };
 #endif
 

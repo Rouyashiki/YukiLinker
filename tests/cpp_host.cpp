@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -22,6 +23,8 @@
 
 #include <utility>
 
+#include "../src/internal/tls_model.hpp"
+#include "control.hpp"
 #include "host_services.h"
 #include "relro_fixture.hpp"
 
@@ -47,12 +50,142 @@ static_assert(!std::is_move_assignable_v<yukilinker::Module>);
 static_assert(!std::is_move_assignable_v<yukilinker::Runtime>);
 
 #if !defined(YUKILINKER_TEST_CFI)
+namespace {
+using VisitPhdr = int (*)(dl_phdr_info*, size_t, void*);
+dl_phdr_info* short_phdr;
+constexpr size_t short_size = offsetof(dl_phdr_info, dlpi_adds);
+
+int iterate_host(void* user, VisitPhdr visit, void* data) {
+  if (short_phdr) return visit(short_phdr, short_size, data);
+  return test_iterate(user, visit, data);
+}
+
+void check_oreo_phdr(yukilinker::Module& module) {
+  const auto iterate = module.symbol<int (*)(VisitPhdr, void*)>("module_iterate");
+  assert(iterate);
+  const size_t page = sysconf(_SC_PAGESIZE);
+  auto* memory = static_cast<char*>(
+      mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  assert(memory != MAP_FAILED && mprotect(memory + page, page, PROT_NONE) == 0);
+  // The next page traps even read-only access beyond Oreo's callback record.
+  dl_phdr_info sample{};
+  sample.dlpi_name = "short-phdr";
+  short_phdr = reinterpret_cast<dl_phdr_info*>(memory + page - short_size);
+  memcpy(short_phdr, &sample, short_size);
+  assert(iterate.value(
+             [](dl_phdr_info* value, size_t size, void*) {
+               assert(size == short_size && !strcmp(value->dlpi_name, "short-phdr"));
+               return 79;
+             },
+             nullptr) == 79);
+  short_phdr = nullptr;
+  assert(munmap(memory, page * 2) == 0);
+}
+
+void check_signal_mask() {
+  const auto bit = [](int signal) { return UINT64_C(1) << (signal - 1); };
+  const auto mask = [](const uint64_t* set) {
+    uint64_t previous = 0;
+    assert(syscall(SYS_rt_sigprocmask, SIG_SETMASK, set, &previous, sizeof(previous)) == 0);
+    return previous;
+  };
+  const uint64_t original = mask(nullptr);
+  const uint64_t seed = original | bit(SIGUSR1) | bit(SIGRTMIN + 1);
+  mask(&seed);
+  const uint64_t initial = mask(nullptr);
+  assert((initial & bit(SIGUSR1)) && (initial & bit(SIGRTMIN + 1)));
+  uint64_t realtime = 0;
+  for (int signal = SIGRTMIN; signal <= SIGRTMAX; ++signal) realtime |= bit(signal);
+  // User-mode QEMU can reserve the guest's highest signals for its own use.
+  const uint64_t all_realtime = initial | realtime;
+  mask(&all_realtime);
+  const uint64_t available = mask(&initial) & realtime;
+  assert(available & bit(SIGRTMIN));
+  {
+    yukilinker::internal::ScopedSignalBlocker outer;
+    const uint64_t active = mask(nullptr);
+    assert((active & bit(SIGUSR2)) && (active & realtime) == available);
+    for (int signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS})
+      assert((active & bit(signal)) == (initial & bit(signal)));
+    for (int signal = __SIGRTMIN; signal < SIGRTMIN; ++signal)
+      assert((active & bit(signal)) == (initial & bit(signal)));
+    {
+      yukilinker::internal::ScopedSignalBlocker nested;
+    }
+    assert(mask(nullptr) == active);
+  }
+  assert(mask(&original) == initial);
+}
+
+void meet(pthread_barrier_t& barrier) {
+  const int status = pthread_barrier_wait(&barrier);
+  assert(status == 0 || status == PTHREAD_BARRIER_SERIAL_THREAD);
+}
+
+uint64_t monotonic_now() {
+  timespec now{};
+  assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_nsec;
+}
+
+void exercise_load_wait(yukilinker::Runtime& runtime, const char* path) {
+  pthread_barrier_t barrier;
+  assert(pthread_barrier_init(&barrier, nullptr, 2) == 0);
+  char address[32];
+  snprintf(address, sizeof(address), "%llx",
+           static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&barrier)));
+  assert(setenv("YUKILINKER_TEST_WAIT_BARRIER", address, 1) == 0);
+  struct Open {
+    yukilinker::Runtime& runtime;
+    const char* path;
+    yukilinker::Module module;
+    static void* run(void* opaque) {
+      auto& self = *static_cast<Open*>(opaque);
+      auto result = self.runtime.open_path(self.path);
+      assert(result);
+      self.module.swap(result.value);
+      return nullptr;
+    }
+  } first{runtime, path, {}}, second{runtime, path, {}};
+  pthread_t loader, waiter;
+  assert(pthread_create(&loader, nullptr, Open::run, &first) == 0);
+  meet(barrier);
+  constexpr uint64_t timeout = 30000000;
+  assert(yukilinker_c_wait_timeout(runtime.native_handle(), timeout) == YUKILINKER_C_OK);
+  const uint64_t start = monotonic_now();
+  auto refused = runtime.open_path(path);
+  assert(!refused && refused.error.code() == yukilinker::Code::Busy &&
+         monotonic_now() - start >= timeout);
+  assert(yukilinker_c_wait_timeout(runtime.native_handle(), 0) == YUKILINKER_C_OK);
+  assert(pthread_create(&waiter, nullptr, Open::run, &second) == 0);
+  const uint64_t limit = monotonic_now() + UINT64_C(10000000000);
+  bool waiting = false;
+  do {
+    yukilinker_c_load_wait slots[8]{};
+    slots[0].size = sizeof(slots[0]);
+    size_t count = 0;
+    assert(yukilinker_c_load_waits(runtime.native_handle(), slots, 8, &count) == YUKILINKER_C_OK);
+    for (size_t i = 0; i < count; ++i) waiting |= slots[i].kind == YUKILINKER_C_LOAD_WAIT_WAIT;
+    if (!waiting) usleep(1000);
+  } while (!waiting && monotonic_now() < limit);
+  assert(waiting);
+  meet(barrier);
+  assert(pthread_join(loader, nullptr) == 0 && pthread_join(waiter, nullptr) == 0);
+  assert(unsetenv("YUKILINKER_TEST_WAIT_BARRIER") == 0 && pthread_barrier_destroy(&barrier) == 0);
+  assert(first.module.close().handle_valid());
+  assert(second.module.close().private_mapping_unmapped());
+  assert(!first.module.close().handle_valid());
+}
+
+}  // namespace
+
 void exercise_lifecycle(yukilinker::Runtime& runtime, const char* directory) {
   char path[4096];
   snprintf(path, sizeof(path), "%s/liblinker_lifecycle.so", directory);
   auto loaded = runtime.open_path(path);
   assert(loaded);
   auto& module = loaded.value;
+  check_oreo_phdr(module);
   struct Thread {
     int* (*slot)();
     int (*on_exit)(int*);
@@ -97,7 +230,7 @@ void exercise_lifecycle(yukilinker::Runtime& runtime, const char* directory) {
   assert(waitpid(retired, &status, 0) == retired && status == 0);
 }
 
-void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* path) {
+void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* directory, const char* path) {
   const int source = open(path, O_RDONLY | O_CLOEXEC);
   struct stat status{};
   assert(source >= 0 && fstat(source, &status) == 0 && status.st_size > 0);
@@ -123,8 +256,9 @@ void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* path) {
     trimmed = true;
   }
   assert(trimmed);
-  const int fd = memfd_create("relro-padding", MFD_CLOEXEC);
-  assert(fd >= 0 && write(fd, data, bytes) == static_cast<ssize_t>(bytes));
+  const int fd = fixture_fd(directory, "relro-padding");
+  assert(fd >= 0 && fcntl(fd, F_GETFD) == FD_CLOEXEC && lseek(fd, 0, SEEK_CUR) == 0);
+  assert(write(fd, data, bytes) == static_cast<ssize_t>(bytes));
   for (const bool file_backed : {false, true}) {
     yukilinker::OpenOptions options;
     options.native.file_backed = file_backed;
@@ -199,6 +333,9 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
   char path[4096];
   snprintf(path, sizeof(path), "%s/liblinker_module.so", directory);
   auto services = test_host_services();
+#if !defined(YUKILINKER_TEST_CFI)
+  services.system_iterate_phdr = iterate_host;
+#endif
   services.log = log_unreleased;
   services.system_dlclose = close_dependency;
   auto source = yukilinker::Runtime::create(services);
@@ -225,13 +362,25 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
   puts("PASS C++ SYSTEM Core and CFI rejection");
   return 0;
 #else
+  check_signal_mask();
+  exercise_load_wait(runtime, path);
+  yukilinker_c_prepare_fork(runtime.native_handle());
+  const pid_t waiting_child = fork();
+  assert(waiting_child >= 0);
+  yukilinker_c_after_fork(runtime.native_handle(), waiting_child == 0);
+  if (!waiting_child) {
+    exercise_load_wait(runtime, path);
+    _exit(0);
+  }
+  int wait_status = 0;
+  assert(waitpid(waiting_child, &wait_status, 0) == waiting_child && wait_status == 0);
 #if defined(YUKILINKER_TEST_X86_CALLS)
   exercise_x86_calls(runtime, directory);
 #endif
 #if defined(__i386__) || defined(__x86_64__)
   exercise_x86_relocations(runtime, directory);
 #endif
-  exercise_relro_mapping(runtime, path);
+  exercise_relro_mapping(runtime, directory, path);
   auto context_source = runtime.context(directory);
   assert(context_source);
   auto context = std::move(context_source);

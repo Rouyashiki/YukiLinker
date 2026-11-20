@@ -97,7 +97,7 @@ inline void exercise_x86_relocations(yukilinker::Runtime& runtime, const char* d
   }
   assert(seen == 31 && weak && at_end);
   const auto open_copy = [&] {
-    const int fd = memfd_create("x86-relocations", MFD_CLOEXEC);
+    const int fd = fixture_fd(directory, "x86-relocations");
     assert(fd >= 0 && write(fd, data, bytes) == static_cast<ssize_t>(bytes));
     auto result = runtime.open_fd(fd);
     assert(close(fd) == 0);

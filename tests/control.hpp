@@ -2,10 +2,39 @@
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
 #pragma once
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <linux/memfd.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "yukilinker.h"
+
+// The test inputs need a seekable descriptor with CLOEXEC, including on old kernels.
+inline int fixture_fd(const char* directory, const char* name) {
+  int fd = static_cast<int>(syscall(SYS_memfd_create, name, MFD_CLOEXEC));
+  if (fd >= 0) return fd;
+  char path[PATH_MAX];
+  const int length = snprintf(path, sizeof(path), "%s/.%s-XXXXXX", directory, name);
+  if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  fd = mkostemp(path, O_CLOEXEC);
+  if (fd >= 0 && unlink(path) != 0) {
+    const int error = errno;
+    close(fd);
+    errno = error;
+    return -1;
+  }
+  return fd;
+}
+
 enum class BootCase {
   Success,
   RejectReady,

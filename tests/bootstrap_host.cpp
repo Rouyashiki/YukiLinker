@@ -274,9 +274,9 @@ void load(BootControl& control, const char* form, bool tango = false, bool retry
 }
 void retire(BootControl& control);
 struct EarlyPacket {
-  int packet = memfd_create("early-packet", MFD_CLOEXEC);
-  int endpoint = memfd_create("endpoint", MFD_CLOEXEC);
-  int module = memfd_create("module", MFD_CLOEXEC);
+  int packet = fixture_fd(fixtures, "early-packet");
+  int endpoint = fixture_fd(fixtures, "endpoint");
+  int module = fixture_fd(fixtures, "module");
   EarlyPacket() {
     assert(packet >= 0 && endpoint >= 0 && module >= 0);
     const yukilinker_c_early_packet_header header{YUKILINKER_C_EARLY_PACKET_MAGIC,
@@ -327,7 +327,7 @@ void malformed_core(const char* needle) {
       ++changed;
     }
   assert(!needle || changed);
-  int damaged = memfd_create("broken-core", MFD_CLOEXEC);
+  int damaged = fixture_fd(fixtures, "broken-core");
   assert(damaged >= 0 && write(damaged, bytes, status.st_size) == status.st_size);
   free(bytes);
   EarlyPacket packet;

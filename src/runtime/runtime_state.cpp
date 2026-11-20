@@ -70,7 +70,7 @@ size_t g_lock_waiters = 0;
 bool g_runtime_creating = false;
 pthread_t g_runtime_creating_thread{};
 LoadWaiter* g_load_waiters = nullptr;
-pthread_cond_t g_load_wait_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t g_load_wait_cond = PTHREAD_COND_INITIALIZER_MONOTONIC_NP;
 alignas(8) uint64_t g_wait_timeout_ns = 0;
 WaitSlot g_wait_slots[kWaitSlots];
 uint32_t g_wait_overflow = 0;

@@ -629,9 +629,9 @@ bool wait_for_thread(pthread_t first, Context* context, ImageState* caller,
   // against the same deadline. A bounded wait that timed out or failed ends the bound: the caller
   // looks once more, and its next round is refused, whether the deadline really passed or the wait
   // reported so at once.
-  const int waited = timeout != 0 ? pthread_cond_clockwait(&g_load_wait_cond, &g_operation_mutex,
-                                                           CLOCK_MONOTONIC, &deadline)
-                                  : pthread_cond_wait(&g_load_wait_cond, &g_operation_mutex);
+  const int waited = timeout != 0
+                         ? pthread_cond_timedwait(&g_load_wait_cond, &g_operation_mutex, &deadline)
+                         : pthread_cond_wait(&g_load_wait_cond, &g_operation_mutex);
   if (waited != 0 && since) *since = kWaitAbandoned;
   for (uintptr_t i = 1; i < depth; ++i) pthread_mutex_lock(&g_operation_mutex);
   held.take_back();

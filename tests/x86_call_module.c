@@ -23,13 +23,21 @@ void* module_tail_lookup(void* handle, const char* name) {
 
 // The same private TLS entry must be selected by an ELF import and by name.
 #if defined(__i386__)
+#if __ANDROID_API__ < 29
+__asm__(".weak ___tls_get_addr");
+#endif
 extern __attribute__((regparm(1))) void* ___tls_get_addr(void*);
 int module_tls_lookup_matches(void) {
-  return dlsym(RTLD_DEFAULT, "___tls_get_addr") == (void*)___tls_get_addr;
+  void* address = dlsym(RTLD_DEFAULT, "___tls_get_addr");
+  return address && address == (void*)___tls_get_addr;
 }
 #else
+#if __ANDROID_API__ < 29
+__asm__(".weak __tls_get_addr");
+#endif
 extern void* __tls_get_addr(void*);
 int module_tls_lookup_matches(void) {
-  return dlsym(RTLD_DEFAULT, "__tls_get_addr") == (void*)__tls_get_addr;
+  void* address = dlsym(RTLD_DEFAULT, "__tls_get_addr");
+  return address && address == (void*)__tls_get_addr;
 }
 #endif
