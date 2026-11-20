@@ -830,17 +830,146 @@ bool validate_versions(ImageState* image) {
   return true;
 }
 
-const char* requires_system_runtime(const ImageState* image) {
+#if YUKILINKER_FULL
+bool rebindable_emutls_accessor(const ImageState* image, const ElfW(Sym) & symbol) {
+  if ((symbol.st_other & 3) != STV_DEFAULT) return false;
+  if (symbol.st_shndx != SHN_UNDEF &&
+      (image->symbolic || ELF64_ST_BIND(symbol.st_info) != STB_WEAK ||
+       ELF64_ST_TYPE(symbol.st_info) != STT_FUNC))
+    return false;
+  const char* name = string_at(image, symbol.st_name);
+  return name && strcmp(name, kEmutlsAccessor) == 0;
+}
+
+// Relocations and locally bound calls through a different ELF name still reach compiler-rt.
+// Match the defining addresses, including non-default versions, before allowing a Core binding.
+static bool classify_emutls_aliases(ImageState* image, const ElfW(Sym) & definition, size_t count) {
+  const auto address = [image](const ElfW(Sym) & symbol) {
+    const uintptr_t bias =
+        symbol.st_shndx == SHN_ABS ? 0 : reinterpret_cast<uintptr_t>(image->memory.bias);
+    uintptr_t value = bias + symbol.st_value;
+#if defined(__arm__)
+    // A Thumb STT_FUNC sets bit 0 while an STT_NOTYPE label at the same instruction leaves it 0.
+    value &= ~uintptr_t{1};
+#endif
+    return value;
+  };
+  uintptr_t single = address(definition);
+  uintptr_t* definitions = &single;
+  if (count > 1) {
+    definitions = static_cast<uintptr_t*>(calloc(count, sizeof(*definitions)));
+    if (!definitions) return fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_METADATA);
+    size_t used = 0;
+    for (size_t i = 0; i < image->symbols.count; ++i) {
+      const auto& symbol = image->symbols.entries[i];
+      if (symbol.st_shndx != SHN_UNDEF &&
+          !strcmp(string_at(image, symbol.st_name), kEmutlsAccessor))
+        definitions[used++] = address(symbol);
+    }
+    qsort(definitions, count, sizeof(*definitions), [](const void* left, const void* right) {
+      const auto a = *static_cast<const uintptr_t*>(left);
+      const auto b = *static_cast<const uintptr_t*>(right);
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  }
+  for (size_t i = 0; i < image->symbols.count; ++i) {
+    const auto& symbol = image->symbols.entries[i];
+    const auto type = ELF64_ST_TYPE(symbol.st_info);
+    if (symbol.st_shndx == SHN_UNDEF || !symbol.st_name ||
+        (type != STT_FUNC && type != STT_NOTYPE && type != STT_GNU_IFUNC))
+      continue;
+    if (!std::binary_search(definitions, definitions + count, address(symbol))) continue;
+    const char* name = string_at(image, symbol.st_name);
+    if (*name && strcmp(name, kEmutlsAccessor)) {
+      image->has_local_emutls_accessor = true;
+      break;
+    }
+  }
+  if (count > 1) free(definitions);
+  return true;
+}
+#endif
+
+const char* classify_runtime_symbols(ImageState* image) {
+#if YUKILINKER_FULL
+  const ElfW(Sym)* defined_accessor = nullptr;
+  size_t accessor_definitions = 0;
+  bool defines_control = false;
+  bool could_have_accessor = false;
+  bool imports_accessor = false, imports_versioned_accessor = false;
+  bool control_binds_locally = image->symbolic;
+  bool uses_keys = false;
+  bool uses_once = false, uses_allocator = false, uses_mutex = false;
+  bool reads_key = false, grows_storage = false;
+#else
+  if (image->host) return nullptr;
+#endif
   for (size_t i = 0; i < image->symbols.count; ++i) {
     const auto& symbol = image->symbols.entries[i];
     const char* name = string_at(image, symbol.st_name);
     if (!name) return "";
+#if YUKILINKER_FULL
+    if (!strcmp(name, kEmutlsAccessor)) {
+      could_have_accessor = true;
+      const bool rebindable = rebindable_emutls_accessor(image, symbol);
+      if (symbol.st_shndx == SHN_UNDEF) {
+        imports_accessor = true;
+        imports_versioned_accessor |= symbol_version(image, i, true) != nullptr;
+      } else {
+        defined_accessor = &symbol;
+        ++accessor_definitions;
+        image->has_local_emutls_accessor |= !rebindable;
+      }
+      image->has_rebindable_emutls_accessor |= !image->host && rebindable;
+    }
+    if (!strncmp(name, "pthread_", 8)) {
+      uses_keys |= !strcmp(name + 8, "key_create") || !strcmp(name + 8, "getspecific") ||
+                   !strcmp(name + 8, "setspecific");
+      reads_key |= !strcmp(name + 8, "getspecific");
+      uses_once |= !strcmp(name + 8, "once");
+      uses_mutex |= !strcmp(name + 8, "mutex_lock") || !strcmp(name + 8, "mutex_unlock");
+    }
+    uses_allocator |= !strcmp(name, "malloc") || !strcmp(name, "realloc") || !strcmp(name, "free");
+    grows_storage |= !strcmp(name, "realloc");
+    if (!strncmp(name, "__emutls_v.", 11)) {
+      image->has_emutls_controls = true;
+      if (symbol.st_shndx != SHN_UNDEF) {
+        defines_control = true;
+        control_binds_locally |=
+            (symbol.st_other & 3) != STV_DEFAULT || ELF64_ST_BIND(symbol.st_info) == STB_LOCAL;
+      }
+    }
+#else
+    // Stage one has no thread storage of its own.
+    if (!strcmp(name, "__emutls_get_address") || !strncmp(name, "__emutls_v.", 11)) return name;
+#endif
+    if (image->host) continue;
     if (strcmp(name, "__cfi_check") == 0 || strncmp(name, "__cfi_slowpath", 14) == 0 ||
         strcmp(name, "__cxa_throw") == 0 || strncmp(name, "_Unwind_", 8) == 0 ||
-        strcmp(name, "__gxx_personality_v0") == 0 || strcmp(name, "__emutls_get_address") == 0 ||
-        strncmp(name, "__emutls_v.", 11) == 0)
+        strcmp(name, "__gxx_personality_v0") == 0)
       return name;
   }
+#if YUKILINKER_FULL
+  // Defining an exported thread_local does not emit an accessor when only other DSOs touch it.
+  // NDK compiler-rt initializes its key once, assigns indices under a mutex, and allocates,
+  // grows and frees thread storage. Wrappers can hide individual key functions, and local
+  // binding can remove control relocations. A passive provider can use pthread_once for its
+  // own keys. Pass -1 checks any remaining passive candidate for references to a control.
+  const bool may_have_local_runtime =
+      uses_keys && (control_binds_locally || (uses_allocator && (uses_once || uses_mutex)) ||
+                    (uses_once && uses_mutex));
+  // A versioned import can survive linking alongside the NDK's hidden unversioned definition.
+  // A stripped DSO with the services used to read or grow compiler-rt's pthread array cannot
+  // establish a single accessor. An unversioned import alone resolves ordinary NDK calls.
+  const bool local_storage = (may_have_local_runtime && (reads_key || grows_storage)) ||
+                             (grows_storage && uses_once && uses_mutex);
+  if (defined_accessor && !image->has_local_emutls_accessor &&
+      !classify_emutls_aliases(image, *defined_accessor, accessor_definitions))
+    return kEmutlsAccessor;
+  image->mixed_emutls_accessors = (imports_accessor && image->has_local_emutls_accessor) ||
+                                  (imports_versioned_accessor && local_storage);
+  image->passive_emutls = defines_control && !could_have_accessor && !may_have_local_runtime;
+#endif
   return nullptr;
 }
 

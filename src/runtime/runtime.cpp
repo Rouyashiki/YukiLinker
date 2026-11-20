@@ -12,6 +12,7 @@
 
 #include "../internal/caller_stubs.hpp"
 #include "../internal/host_imports.hpp"
+#include "../internal/private_pthread_keys.hpp"
 #include "../internal/registry.hpp"
 #include "../internal/runtime_model.hpp"
 
@@ -108,12 +109,13 @@ void record_failure(ImageState* image) {
 // it, or a TLS block or thread destructor that was taken for it. Collection and the failure
 // sweep both have to see all of them before the image may be freed.
 bool image_is_pinned(const ImageState* image) {
-  return image->snapshot_refs || image->lease_refs || image->active_calls || image->tls_users ||
+  return image->snapshot_refs || image->lease_refs || image->active_calls() || image->tls_users ||
          image->thread_destructors;
 }
 
 bool free_image_state(ImageState* image) {
 #if YUKILINKER_FULL
+  retire_private_keys(image);
   if (image->token != 0) {
     g_image_index.erase(image->token);
     g_generation_index.erase(image->generation);
@@ -423,8 +425,7 @@ SoHandle* load_image(int memfd, const char* vma_name, bool file_backed, uint64_t
       (void)snprintf(image->origin, sizeof(image->origin), "[yukilinker:%llu]",
                      static_cast<unsigned long long>(image->generation));
   }
-  const char* system_symbol =
-      metadata_ready && !image->host ? requires_system_runtime(image) : nullptr;
+  const char* system_symbol = metadata_ready ? classify_runtime_symbols(image) : nullptr;
   if (system_symbol) {
     // fail copies the name before the image's strings are unmapped.
     fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, system_symbol);
@@ -620,7 +621,7 @@ bool wait_for_thread(pthread_t first, Context* context, ImageState* caller,
   LoadWaiter waiter{self, first, context, g_load_waiters, caller};
   g_load_waiters = &waiter;
   if (context) ++context->waiting_opens;
-  if (caller) ++caller->active_calls;
+  if (caller) ++caller->non_tls_calls;
   HeldOperation held;
   held.put_aside();
   // The recursive lock is held depth times; the wait releases the last one.
@@ -635,7 +636,7 @@ bool wait_for_thread(pthread_t first, Context* context, ImageState* caller,
   if (waited != 0 && since) *since = kWaitAbandoned;
   for (uintptr_t i = 1; i < depth; ++i) pthread_mutex_lock(&g_operation_mutex);
   held.take_back();
-  if (caller) --caller->active_calls;
+  if (caller) --caller->non_tls_calls;
   if (context) --context->waiting_opens;
   LoadWaiter** link = &g_load_waiters;
   while (*link != &waiter) link = &(*link)->next;
@@ -802,8 +803,13 @@ bool replay_image(ImageState* image, uint64_t first_generation) {
 bool replay_group(ImageState* root, uint64_t first_generation) {
   // Ordinary relocations can alter note bytes; validate the whole group again
   // before any hook publishes shadow or any resolver can execute.
-  for (auto* image = g_first_image; image; image = image->next)
-    if (in_group(image, first_generation) && !validate_hwasan_globals(image)) return false;
+  for (auto* image = g_first_image; image; image = image->next) {
+    if (!in_group(image, first_generation)) continue;
+    if (!validate_hwasan_globals(image)) return false;
+#if YUKILINKER_FULL
+    if (!validate_emutls_controls(image)) return false;
+#endif
+  }
   // An IFUNC can call into any member of its group, including a dependency cycle.
   for (auto* image = g_first_image; image; image = image->next)
     if (in_group(image, first_generation) && !register_hwasan_globals(image)) return false;
@@ -1002,7 +1008,6 @@ void* dlsym(SoHandle* handle, const char* name) {
   return resolution.valid ? reinterpret_cast<void*>(resolution.address) : nullptr;
 }
 
-namespace {
 void mark_image(ImageState* image) {
   if (!image || image->marked) return;
   image->marked = true;
@@ -1010,6 +1015,7 @@ void mark_image(ImageState* image) {
   for (auto* dep = image->dependencies; dep; dep = dep->next) mark_image(dep->image);
 }
 
+namespace {
 // As Bionic's soinfo::can_unload: RTLD_GLOBAL (or DF_1_GLOBAL) keeps an image as RTLD_NODELETE
 // does, whatever its open count. Only an explicit retirement of its context, which has sealed it
 // (Destroying), may unload it.
@@ -1035,11 +1041,14 @@ bool reentry_kept(const ImageState* image) {
 
 // Every external user the free loop rechecks: a callback can admit one while collection drops the
 // lock.
+bool held_outside_tls(const ImageState* image) {
+  return image->references || image->active_calls() || image->caller_calls ||
+         image->snapshot_refs || image->lease_refs || image->execution_leases ||
+         image->unwind_leases || image->cfi_leases || image->host_bridge_leases;
+}
+
 bool held_image(const ImageState* image) {
-  return image->references || image->active_calls || image->caller_calls || image->snapshot_refs ||
-         image->lease_refs || image->execution_leases || image->unwind_leases ||
-         image->cfi_leases || image->host_bridge_leases || image->tls_users ||
-         image->thread_destructors;
+  return held_outside_tls(image) || image->tls_users || image->thread_destructors;
 }
 
 void keep_callback_image(ImageState* image) {
@@ -1144,7 +1153,7 @@ struct ClosingSet {
 // A metadata page left mapped clears *complete and the pass goes on. A reservation left mapped
 // keeps its image as a dead copy, for a later collection to retry, and the pass goes on with the
 // other images; it then returns false.
-bool collect_pass(uint64_t first_new, bool* complete) {
+bool collect_pass(uint64_t first_new, bool* complete, bool& may_reap_threads) {
   bool unmapped = true;
   // Most collections (a lease, snapshot or close that leaves every image kept) find nothing to
   // retire: an image no root keeps is one that no reference, pin or flag holds itself. Without
@@ -1155,7 +1164,8 @@ bool collect_pass(uint64_t first_new, bool* complete) {
     for (auto* image = g_first_image; image && !candidate; image = image->next)
       candidate = image->phase == Phase::Closing ||
                   (image->generation < first_new && !image->references && !image->snapshot_refs &&
-                   !image->lease_refs && !image->tls_users && !image->thread_destructors &&
+                   !image->lease_refs &&
+                   (may_reap_threads || (!image->tls_users && !image->thread_destructors)) &&
                    !(image->flags & RTLD_NODELETE) && !reentry_kept(image) && !kept_global(image) &&
                    image->phase != Phase::Preparing && image->phase != Phase::Relocated &&
                    image->phase != Phase::Initializing);
@@ -1166,12 +1176,27 @@ bool collect_pass(uint64_t first_new, bool* complete) {
     // What holds an image for good, or until its holder lets it go: a reference, a pin, a flag, an
     // open under way, a scope's retirement still ahead of a return-address hold.
     for (auto* image = g_first_image; image; image = image->next)
-      if (image->references || image->snapshot_refs || image->lease_refs || image->tls_users ||
-          image->thread_destructors || (image->flags & RTLD_NODELETE) || reentry_kept(image) ||
-          kept_global(image) || image->phase == Phase::Preparing ||
-          image->phase == Phase::Relocated || image->phase == Phase::Initializing ||
-          image->generation >= first_new)
+      if (image->references || image->snapshot_refs || image->lease_refs ||
+          (!may_reap_threads && (image->tls_users || image->thread_destructors)) ||
+          (image->flags & RTLD_NODELETE) || reentry_kept(image) || kept_global(image) ||
+          image->phase == Phase::Preparing || image->phase == Phase::Relocated ||
+          image->phase == Phase::Initializing || image->generation >= first_new)
         mark_image(image);
+#if YUKILINKER_FULL
+    if (may_reap_threads) {
+      // The ordinary roots and their dependencies are marked. Probe thread liveness only if
+      // stale TLS could be keeping an otherwise collectible image, at most once per collection.
+      for (auto* image = g_first_image; image; image = image->next)
+        if (!image->marked && !image->caller_calls && !image->active_calls() &&
+            (image->tls_users || image->thread_destructors)) {
+          reap_exited_threads();
+          may_reap_threads = false;
+          break;
+        }
+      for (auto* image = g_first_image; image; image = image->next)
+        if (!image->marked && (image->tls_users || image->thread_destructors)) mark_image(image);
+    }
+#endif
     // An image nothing else keeps, held only by a call its own code made into the runtime: that
     // code runs on once the call returns, and no count sees it end. It is kept with a
     // return-address hold from here until its scope's retirement, and so is what it needs.
@@ -1185,13 +1210,19 @@ bool collect_pass(uint64_t first_new, bool* complete) {
     // while it lasts: the image's code returns before the frame does, so nothing is left once it
     // ends.
     for (auto* image = g_first_image; image; image = image->next)
-      if (!image->marked && image->active_calls) mark_image(image);
-    for (auto* image = g_last_image; image; image = image->previous)
-      if (!image->marked && image->phase != Phase::Closing && image->generation < first_new) {
+      if (!image->marked && image->active_calls()) mark_image(image);
+    for (auto* image = g_last_image; image; image = image->previous) {
+      if (image->marked || image->generation >= first_new) continue;
+      const bool starting = image->phase != Phase::Closing;
+      if (!starting && !image->lifecycle.initialized) continue;
+      // Resumed finalizers can look up their own symbols and those of dependencies closing
+      // in this pass. A copy waiting only for unmap or dependency cleanup stays invisible.
+      image->closing_pass = g_collection_pass;
+      if (starting) {
         image->phase = Phase::Closing;
-        image->closing_pass = g_collection_pass;
         record_event(image, YUKILINKER_C_EVENT_CLOSE);
       }
+    }
   }
   // Finalizers run latest initialized first, each one dropping the lock. No image becomes Closing
   // and initialized meanwhile (only this pass makes images Closing), so the order taken here is
@@ -1200,7 +1231,7 @@ bool collect_pass(uint64_t first_new, bool* complete) {
   // to it; the free loop below keeps it until they are done.
   const auto finalizable = [](const ImageState* image) {
     return image->phase == Phase::Closing && image->lifecycle.initialized &&
-           !image->lifecycle.fini_running &&
+           !image->lifecycle.fini_thread && !finalization_held(image) &&
            image->lifecycle.blocked_cleanup_pass != g_collection_pass;
   };
   ClosingSet closing;
@@ -1271,23 +1302,23 @@ bool collect_pass(uint64_t first_new, bool* complete) {
           wake_collect_waiters();
           continue;
         }
-        // libc removal dropped the lock. A new observer can now pin this dead
-        // copy; never carry the earlier free-loop decision across that call.
+        // libc removal dropped the lock. Close admission before the final pin check so even a
+        // reentrant key write on this thread cannot pin the image between the check and munmap.
+        const bool was_releasing = image->releasing;
+        image->releasing = true;
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
         if (held_image(image) || reentry_kept(image)) {
+          image->releasing = was_releasing;
           keep_callback_image(image);
           continue;
         }
         if (image->lifecycle.initialized || reached_from_kept(image)) {
+          image->releasing = was_releasing;
           image->closing_pass = 0;
           wake_collect_waiters();
           continue;
         }
         deactivate_tls(image);
-        // The lock stays held from here to unregister_image, so no other thread sees the image
-        // in between, and no other thread's snapshot holds it (held_image above). releasing
-        // hides it from a signal handler on this thread whose private dl_iterate_phdr runs
-        // between the munmap and unregister_image.
-        image->releasing = true;
         unregister_hwasan_globals(image);
         const bool released = [&] {
           if (image->mapping_released) return true;
@@ -1384,6 +1415,11 @@ bool collect_images_internal() {
       wake_collect_waiters();
     }
   } collecting;
+#if YUKILINKER_FULL
+  bool may_reap_threads = private_key_threads_active() || g_thread_states;
+#else
+  bool may_reap_threads = false;
+#endif
   const uint64_t first_new = g_next_image_generation;
   bool complete = true;
   // A failed unmap ends no pass and drops no request made meanwhile.
@@ -1392,24 +1428,64 @@ bool collect_images_internal() {
     // Each pass clears the request first, so a stale one is never read.
     g_collect_again = false;
     ++g_collection_pass;
-    unmapped &= collect_pass(first_new, &complete);
+    unmapped &= collect_pass(first_new, &complete, may_reap_threads);
   } while (g_collect_again);
   return unmapped && complete;
 }
 }  // namespace
 
+bool retiring_here(const ImageState* image) {
+#if YUKILINKER_FULL
+  if (image->phase != Phase::Closing || image->releasing) return false;
+  if (retiring_image(image) && pthread_equal(g_collecting_thread, pthread_self())) return true;
+  // Between close attempts, TLS destructors and process-exit finalizers can still use
+  // the live dependencies their frames retain, including ones from an earlier load group.
+  if (!image->lifecycle.initialized || !g_operation_depth_valid) return false;
+  for (auto* frame = static_cast<CallbackGuard*>(pthread_getspecific(g_callback_key)); frame;
+       frame = frame->previous) {
+    auto* owner = frame->image;
+    if (!owner || frame->code == CallbackGuard::Code::Host) continue;
+    if (frame->code != CallbackGuard::Code::TlsDestructor && !finalizing_at_exit_here(owner))
+      continue;
+    if (owner == image) return true;
+    const uint64_t visit = ++g_graph_visit;
+    reach_image(owner, visit);
+    if (image->graph_visit == visit) return true;
+  }
+#else
+  (void)image;
+#endif
+  return false;
+}
+
 bool collect_images() { return collect_images_internal(); }
 
 #if YUKILINKER_FULL
+// A finalizer may join a worker that first touches TLS. Its own image and live dependencies
+// stay mapped across the unlocked callback, including while their namespace is retiring.
+bool held_by_running_finalizer(const ImageState* target) {
+  if (target->lifecycle.fini_thread) return true;
+  const uint64_t visit = ++g_graph_visit;
+  for (auto* image = g_first_image; image; image = image->next) {
+    if (!image->lifecycle.fini_thread) continue;
+    reach_image(image, visit);
+    if (target->graph_visit == visit) return true;
+  }
+  return false;
+}
+
 namespace {
 
 // Whether an explicit retirement may unload every image of scope at once (retire_scope_images).
-// Reads only.
 bool scope_retirable(const Context* scope) {
-  for (auto* image = g_first_image; image; image = image->next)
-    if (image->context == scope && ((image->flags & RTLD_NODELETE) || held_image(image) ||
-                                    image_loading(image) || image->releasing))
+  bool tls_held = false;
+  for (auto* image = g_first_image; image; image = image->next) {
+    if (image->context != scope) continue;
+    if ((image->flags & RTLD_NODELETE) || held_outside_tls(image) || image_loading(image) ||
+        image->releasing)
       return false;
+    tls_held |= image->tls_users || image->thread_destructors;
+  }
   // What an image of another context reaches through a DT_NEEDED edge, a symbol provider, a
   // namespace link or its load root.
   const uint64_t visit = ++g_graph_visit;
@@ -1420,6 +1496,12 @@ bool scope_retirable(const Context* scope) {
   }
   for (auto* image = g_first_image; image; image = image->next)
     if (image->context == scope && image->graph_visit == visit) return false;
+  if (tls_held) {
+    // Only stale thread holds can still prevent this retirement.
+    reap_exited_threads();
+    for (auto* image = g_first_image; image; image = image->next)
+      if (image->context == scope && (image->tls_users || image->thread_destructors)) return false;
+  }
   return true;
 }
 
@@ -1433,8 +1515,8 @@ uint32_t retire_scope_images(Context* scope) {
   for (auto* image = g_first_image; image && !any; image = image->next)
     any = image->context == scope;
   if (!any) return YUKILINKER_C_OK;
-  // A sealed context was partly retired by an earlier call; it resumes without the holder checks,
-  // as nothing can have been added to it since.
+  // A sealed context resumes partial retirement. Collection rechecks the TLS pins its
+  // finalizers may have acquired while the operation lock was dropped.
   if (!sole_holder() || g_collecting || (!sealed && !scope_retirable(scope)))
     return YUKILINKER_C_BUSY;
   // Sealed before the collection drops the lock in a finalizer, and never unsealed: from here on
@@ -1448,11 +1530,12 @@ uint32_t retire_scope_images(Context* scope) {
 }
 
 bool other_thread_states() {
+  if (private_key_threads_active()) return true;
   const auto* own = g_thread_tls_key_valid
                         ? static_cast<const ThreadTlsState*>(pthread_getspecific(g_thread_tls_key))
                         : nullptr;
   for (const ThreadTlsState* state = g_thread_states; state; state = state->next)
-    if (state != own || state->first || state->destructors) return true;
+    if (state != own || state->first || state->emutls || state->destructors) return true;
   return false;
 }
 #endif  // #if YUKILINKER_FULL
@@ -1580,7 +1663,7 @@ void abandon_waits() {
     }
     *link = waiter->next;
     if (waiter->context) --waiter->context->waiting_opens;
-    if (waiter->caller) --waiter->caller->active_calls;
+    if (waiter->caller) --waiter->caller->non_tls_calls;
   }
 }
 
@@ -1628,7 +1711,7 @@ void abandon_callback_frames(void* innermost) {
       free(frame);
     } else {
       if (frame->saved_state) admissions += frame->depth;
-      if (frame->image) --frame->image->active_calls;
+      if (frame->image) --frame->active_counter();
     }
     frame = previous;
   }
@@ -1640,8 +1723,8 @@ void abandon_callback_frames(void* innermost) {
   abandon_shutdown_run(self);
   // A finalization this thread ended inside goes on with the next run, from the step after.
   for (auto* image = g_first_image; image; image = image->next)
-    if (image->lifecycle.fini_running && pthread_equal(image->lifecycle.fini_thread, self))
-      image->lifecycle.fini_running = false;
+    if (image->lifecycle.fini_thread && pthread_equal(image->lifecycle.fini_thread, self))
+      image->lifecycle.fini_thread = {};
   const bool collecting = g_collecting && pthread_equal(g_collecting_thread, self);
   if (collecting) {
     g_collecting = false;
@@ -1664,15 +1747,14 @@ void abandon_snapshots(void* innermost) {
   bool collect = false;
   for (auto* snapshot = static_cast<SnapshotGuard*>(innermost); snapshot;) {
     SnapshotGuard* previous = snapshot->previous;
-    for (size_t i = 0; i < snapshot->count; ++i) --snapshot->images[i]->active_calls;
+    for (size_t i = 0; i < snapshot->count; ++i) --snapshot->images[i]->non_tls_calls;
     if (snapshot->waitable) {
       SnapshotGuard** link = &g_active_snapshots;
       while (*link && *link != snapshot) link = &(*link)->next_active;
       if (*link) *link = snapshot->next_active;
     }
     collect |= snapshot->collect_after;
-    // Each guard starts its iteration's calloc block.
-    free(snapshot);
+    if (snapshot->heap_allocated) free(snapshot);
     snapshot = previous;
   }
   // A close on another thread may wait for this iteration.
@@ -1721,6 +1803,7 @@ bool release_leftovers() {
 #if YUKILINKER_FULL
 uint32_t begin_shutdown() {
   if (g_shutdown_phase != ShutdownPhase::kActive) return YUKILINKER_C_OK;
+  reap_exited_threads();
   // Every check reads only and none drops the lock, so nothing can be added between them and the
   // boundary below: a refusal changes nothing, the host imports included.
   bool blocked = !sole_holder() || g_collecting || g_contexts != nullptr;
@@ -1786,12 +1869,15 @@ bool shutdown() {
 #endif
 #if YUKILINKER_FULL
   if (!sole_holder()) return false;
+  // A finalizer can arm this thread's dispatch key after begin_shutdown. A peer deleting
+  // its last value leaves the empty record for this thread to disarm, including on retry.
+  reap_exited_threads();
   // This thread's state goes if it holds nothing. Another thread's stays: its exit runs runtime
   // code (the TLS key destructor), so the runtime has to outlive that thread.
   if (g_thread_tls_key_valid)
     release_empty_thread_tls_state(
         static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key)));
-  if (g_thread_states) {
+  if (g_thread_states || private_key_threads_active()) {
     host_log_error("yukilinker: shutdown blocked by thread state");
     return false;
   }
@@ -1839,6 +1925,7 @@ bool shutdown() {
     destroy_thread_tls_state(thread);
   }
   retire_dl_error_key();
+  shutdown_private_keys();
   if (g_initializing_key_valid) {
     pthread_key_delete(g_initializing_key);
     __atomic_store_n(&g_initializing_key_valid, false, __ATOMIC_RELEASE);

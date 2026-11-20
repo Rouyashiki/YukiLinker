@@ -63,16 +63,15 @@ int forward_system_image(struct dl_phdr_info* info, size_t size, void* opaque) {
                      state->user);
 }
 
-// A Closing image is still mapped while this thread's collection runs its finalizers, which may
-// throw and catch inside it: the unwinder must find it. Another thread's collection may unmap it.
-// releasing marks the one this thread's collection unmaps next. The lock stays held from that
-// munmap to unregister_image, so only a signal handler on this thread can iterate then; another
-// thread's snapshot never holds it, as its pin would have kept the image (held_image).
+// The unwinder may enumerate Closing images on the thread running their finalizers. Between
+// close attempts, a TLS destructor can enumerate its own image and the dependencies it pins.
+// releasing marks the image whose unmap is in progress, including for a signal on this thread.
 bool bridge_visible(const ImageState* image, const ImageState* caller) {
   if (caller && image->context != caller->context) return false;
   if (accessible_image(image)) return true;
-  return image->phase == Phase::Closing && !image->releasing && g_collecting &&
-         pthread_equal(g_collecting_thread, pthread_self());
+  if (image->phase != Phase::Closing || image->releasing) return false;
+  return (g_collecting && pthread_equal(g_collecting_thread, pthread_self())) ||
+         retiring_here(image);
 }
 
 }  // namespace

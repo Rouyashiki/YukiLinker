@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include "../internal/private_pthread_keys.hpp"
 #include "../internal/relocation_targets.hpp"
 #include "../internal/runtime_model.hpp"
 #if defined(YUKILINKER_RUNTIME)
@@ -11,8 +12,7 @@
 namespace yukilinker::internal {
 
 uintptr_t invoke_ifunc(ImageState* image, uintptr_t resolver) {
-  CallbackGuard callback_scope(image);
-  callback_scope.runs_image_code = true;
+  CallbackGuard callback_scope(image, CallbackGuard::Code::Image);
 #if defined(__aarch64__)
   __ifunc_arg_t arguments{};
   arguments._size = sizeof(arguments);
@@ -30,7 +30,7 @@ uintptr_t invoke_ifunc(ImageState* image, uintptr_t resolver) {
 #endif  // #if defined(__aarch64__)
 }
 
-SymbolResolution materialize_defined_symbol(ImageState* image, const ElfW(Sym) & symbol) {
+static SymbolResolution defined_symbol_value(ImageState* image, const ElfW(Sym) & symbol) {
   if (symbol.st_shndx == SHN_UNDEF) return {};
   uintptr_t address;
   if (symbol.st_shndx == SHN_ABS) {
@@ -57,6 +57,17 @@ SymbolResolution materialize_defined_symbol(ImageState* image, const ElfW(Sym) &
     address = invoke_ifunc(image, address);
   }
   return {address, true};
+}
+
+SymbolResolution materialize_defined_symbol(ImageState* image, const ElfW(Sym) & symbol) {
+  auto value = defined_symbol_value(image, symbol);
+#if YUKILINKER_FULL
+  if (image->managed_emutls && image->emutls_accessor_provider &&
+      value.address == reinterpret_cast<uintptr_t>(image->emutls_accessor_provider) &&
+      rebindable_emutls_accessor(image, symbol))
+    value.address = reinterpret_cast<uintptr_t>(yuki_emutls_get_address);
+#endif
+  return value;
 }
 
 namespace {
@@ -258,6 +269,25 @@ bool walk_handle_scope(ImageState* root, bool (*visit)(ImageState*, void*), void
           }).failed;
 }
 
+Dependency* retain_external_provider(ImageState* consumer, ImageState* provider) {
+  auto** link = &consumer->dependencies;
+  while (*link && (*link)->image != provider) link = &(*link)->next;
+  if (!*link) {
+    *link = metadata_object<Dependency>(&consumer->memory.metadata);
+    if (!*link) {
+      fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_RELOCATIONS);
+      return nullptr;
+    }
+    (*link)->image = provider;
+    (*link)->symbol_provider = true;
+  }
+  return *link;
+}
+
+bool retain_symbol_provider(ImageState* consumer, ImageState* provider) {
+  return !provider || consumer == provider || retain_external_provider(consumer, provider);
+}
+
 SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocation_type) {
   const auto* symbol = symbol_at(image, index);
   if (!symbol || !symbol_name_valid(image->symbols, *symbol)) return {};
@@ -275,10 +305,30 @@ SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocatio
     if (void* stub = caller_stub_for(image, name)) return {nullptr, nullptr, stub, true};
 #endif
     if (!image->host || strcmp(name, arch::kTlsGetAddr) == 0)
-      if (void* replacement = module_api_symbol(name)) return {nullptr, nullptr, replacement, true};
+      if (void* replacement = module_api_symbol(name)) {
+#if YUKILINKER_FULL
+        image->binds_core_wrapper = true;
+#endif
+        return {nullptr, nullptr, replacement, true};
+      }
   }
   auto target = search_scope(image->load_root ? image->load_root : image, name, version,
                              GlobalLookup::Relocation);
+#if YUKILINKER_FULL
+  const bool emutls_control =
+      (image->host || image->has_emutls_controls) && !strncmp(name, "__emutls_v.", 11);
+  const bool emutls_accessor = image->managed_emutls && image->has_rebindable_emutls_accessor &&
+                               rebindable_emutls_accessor(image, *symbol);
+  auto incompatible_emutls = [&] {
+    // Two local compiler-rt instances would read the same index in different pthread arrays.
+    // Keep the system's scope order: a system definition or explicit host import cannot be
+    // silently replaced with a lower-priority private definition.
+    fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, name, version);
+    SymbolTarget refused;
+    refused.failed = true;
+    return refused;
+  };
+#endif
 #if defined(YUKILINKER_RUNTIME)
   if (!target.found && !target.failed && symbol->st_shndx == SHN_UNDEF &&
       image->context->host_imports) {
@@ -287,16 +337,15 @@ SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocatio
     const HostImportResult imported = resolve_host_import(image, name, version, relocation_type);
     if (imported.found) {
       image->host_import_mask |= uint32_t{1} << imported.index;
-      return {nullptr, nullptr, imported.address, true};
-    }
-    if (imported.failed) {
+      target = {nullptr, nullptr, imported.address, true};
+    } else if (imported.failed) {
       // NO_MEMORY is recorded already.
       target.failed = true;
     } else if (imported.refused) {
       fail_refused(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, imported.reason,
                    imported.library, name, version);
       target.failed = true;
-    } else if (ELF64_ST_BIND(symbol->st_info) != STB_WEAK) {
+    } else if (ELF64_ST_BIND(symbol->st_info) != STB_WEAK && !(emutls_accessor && !version)) {
       host_log_error(
           "yukilinker: %s%s%s not found for %s; the system's global group is searched only for "
           "a namespace's host imports, and %s",
@@ -307,21 +356,73 @@ SymbolTarget symbol_target(ImageState* image, uint32_t index, uint32_t relocatio
 #else
   (void)relocation_type;
 #endif
+#if YUKILINKER_FULL
+  if (emutls_control && target.found) {
+    // A trusted image on either side may bind its accessor later in the group. Keep the actual
+    // provider until pass 1 completes so validation can compare both bindings.
+    bool native_import = !target.image;
+    if (!target.image) {
+      if (!image->host) return incompatible_emutls();
+    } else if (!target.symbol || ELF64_ST_TYPE(target.symbol->st_info) != STT_OBJECT) {
+      return incompatible_emutls();
+    } else if (target.image != image && (image->host || target.image->host)) {
+      // Pass 0 checks the symbol but does not bind it. Only retain the provider pass 1 selects.
+      if (g_relocation_pass == 0) return target;
+      auto* edge = retain_external_provider(image, target.image);
+      if (!edge) {
+        target.failed = true;
+        return target;
+      }
+      edge->emutls_control = index;
+      native_import = image->host && target.image->host && target.image->passive_emutls;
+    } else if (!shares_emutls_accessor(image, target.image)) {
+      return incompatible_emutls();
+    }
+    if (native_import && g_relocation_pass == 1) {
+      const auto value = materialize_target(target);
+      if (!value.valid) {
+        fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS, name, version);
+        target.failed = true;
+        return target;
+      }
+      auto*& head = image->native_emutls_controls;
+      if (!head || head->provider != target.image || head->address != value.address) {
+        auto* binding = metadata_object<NativeEmutlsControl>(&image->memory.metadata);
+        if (!binding) {
+          fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_RELOCATIONS, name, version);
+          target.failed = true;
+          return target;
+        }
+        *binding = {index, target.image, value.address, head};
+        head = binding;
+      }
+    }
+  }
+  if (emutls_accessor && !target.failed && (target.found || !version)) {
+    void* builtin = reinterpret_cast<void*>(yuki_emutls_get_address);
+    void* provider = target.found ? target.address : builtin;
+    if (target.image) {
+      if (ELF64_ST_TYPE(target.symbol->st_info) != STT_FUNC) return incompatible_emutls();
+      // Compare the defining address even when the provider also binds its calls to Core.
+      const auto resolved = defined_symbol_value(target.image, *target.symbol);
+      if (!resolved.valid || !retain_symbol_provider(image, target.image))
+        return incompatible_emutls();
+      provider = reinterpret_cast<void*>(resolved.address);
+    }
+    if (!provider ||
+        (image->emutls_accessor_provider && image->emutls_accessor_provider != provider))
+      return incompatible_emutls();
+    image->emutls_accessor_provider = provider;
+    image->binds_core_emutls = true;
+    return {nullptr, nullptr, builtin, true};
+  }
+  if (target.found && !target.image) {
+    void* address = private_pthread_address(image, name, target.address);
+    if (address != target.address) image->binds_core_wrapper = true;
+    target.address = address;
+  }
+#endif
   return target;
-}
-
-bool retain_symbol_provider(ImageState* consumer, ImageState* provider) {
-  if (!provider || consumer == provider) return true;
-  for (auto* dep = consumer->dependencies; dep; dep = dep->next)
-    if (dep->image == provider) return true;
-  auto* dependency = metadata_object<Dependency>(&consumer->memory.metadata);
-  if (!dependency) return fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_RELOCATIONS);
-  dependency->image = provider;
-  dependency->symbol_provider = true;
-  Dependency** tail = &consumer->dependencies;
-  while (*tail) tail = &(*tail)->next;
-  *tail = dependency;
-  return true;
 }
 
 // Takes the target the caller already looked up, so a relocation is resolved exactly once.
@@ -562,6 +663,28 @@ bool symbol_value_type(uint32_t type) {
          pc_relative(type);
 }
 
+#if YUKILINKER_FULL
+bool native_emutls_accessor(const ImageState* image, const ImageState* names,
+                            const ElfW(Sym) & symbol) {
+  if (image->managed_emutls || (!image->host && !image->has_emutls_controls)) return false;
+  const char* name = string_at(names, symbol.st_name);
+  return name && strcmp(name, kEmutlsAccessor) == 0;
+}
+
+// Native compiler-rt callers use the resolved function directly, including a private IFUNC's
+// result. Different versioned bindings can coexist, but cannot describe one index space for lookup.
+bool record_native_emutls_accessor(ImageState* image, uintptr_t address) {
+  void* provider = reinterpret_cast<void*>(address);
+  if (!provider || (image->emutls_accessor_provider && image->emutls_accessor_provider != provider))
+    image->mixed_emutls_accessors = true;
+  if (provider == reinterpret_cast<void*>(yuki_emutls_get_address)) image->binds_core_emutls = true;
+  image->emutls_accessor_provider = provider;
+  if (image->binds_core_emutls && image->mixed_emutls_accessors)
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, kEmutlsAccessor);
+  return true;
+}
+#endif
+
 // RELA GLOB_DAT/JUMP_SLOT take the explicit addend. Bionic ignores the GOT contents for REL.
 void write_symbol_value(uint32_t type, void* destination, uintptr_t address, ElfW(Sxword) addend) {
 #if !defined(__LP64__)
@@ -627,6 +750,11 @@ bool replay_deferred_relocations(ImageState* image) {
     if (!provider_retained(image, entry.provider)) return false;
     const SymbolResolution resolution = materialize_defined_symbol(entry.provider, *entry.symbol);
     if (!resolution.valid) return false;
+#if YUKILINKER_FULL
+    if (native_emutls_accessor(image, entry.provider, *entry.symbol) &&
+        !record_native_emutls_accessor(image, resolution.address))
+      return false;
+#endif
     write_symbol_value(entry.type, destination, resolution.address, entry.addend);
   }
   return true;
@@ -684,6 +812,17 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
     if (tls) image->relocations.tls = true;
     const auto* symbol = symbol_at(image, symbol_index);
     if (symbol_index && !symbol) return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS);
+#if YUKILINKER_FULL
+    if (symbol_index && image->has_rebindable_emutls_accessor && symbol_value_type(type) &&
+        rebindable_emutls_accessor(image, *symbol))
+      image->managed_emutls = true;
+    if (symbol_index && image->passive_emutls) {
+      // A reference to a control rules out assuming a passive provider, even if wrappers
+      // have hidden every pthread key import of its local accessor.
+      const char* name = string_at(image, symbol->st_name);
+      if (name && !strncmp(name, "__emutls_v.", 11)) image->passive_emutls = false;
+    }
+#endif
     // Initial-exec TLS has no static block here; only a weak symbol that stays undefined works.
     if (static_tls && (!symbol || ELF64_ST_BIND(symbol->st_info) != STB_WEAK))
       return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
@@ -693,6 +832,14 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
   // Pass 0 checks TLS references only; every other symbol is looked up once, in pass 1.
   if (g_relocation_pass == 0) {
 #if YUKILINKER_FULL
+    if (!image->host && image->has_emutls_controls && symbol_index) {
+      const char* name = string_at(image, image->symbols.entries[symbol_index].st_name);
+      if (name && !strncmp(name, "__emutls_v.", 11) &&
+          symbol_target(image, symbol_index, type).failed) {
+        name_relocation(relocation.r_offset, type);
+        return false;
+      }
+    }
     if (tls) {
       TlsReference reference;
       // A module-id relocation ignores its addend, including the initial GOT word in REL.
@@ -740,13 +887,24 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
   if (indirect)
     return defer_relocation(image, {relocation.r_offset, addend, nullptr, nullptr, type});
   if (symbol_value_type(type) && target.symbol &&
-      ELF64_ST_TYPE(target.symbol->st_info) == STT_GNU_IFUNC)
+      ELF64_ST_TYPE(target.symbol->st_info) == STT_GNU_IFUNC) {
+#if YUKILINKER_FULL
+    if (native_emutls_accessor(image, target.image, *target.symbol))
+      image->deferred_emutls_accessor = true;
+#endif
     return defer_relocation(image,
                             {relocation.r_offset, addend, target.image, target.symbol, type});
+  }
 
   if (symbol_value_type(type)) {
     auto symbol = resolve_symbol(image, symbol_index, target);
     if (!symbol.valid) return false;
+#if YUKILINKER_FULL
+    if (symbol_index && target.found &&
+        native_emutls_accessor(image, image, image->symbols.entries[symbol_index]) &&
+        !record_native_emutls_accessor(image, symbol.address))
+      return false;
+#endif
 #if defined(__i386__) || defined(__x86_64__)
     // Bionic uses P as S for an unresolved weak PC32, leaving exactly the addend in the slot.
     if (symbol_index && !target.found && pc_relative(type))
@@ -883,10 +1041,15 @@ bool relocate_image(ImageState* image) {
   if (g_relocation_pass == 2) {
     const bool replayed = replay_deferred_relocations(image);
     discard_deferred_relocations(image);
+#if YUKILINKER_FULL
+    if (image->deferred_emutls_accessor) {
+      image->deferred_emutls_accessor = false;
+      if (replayed && image->binds_core_emutls && !validate_emutls_controls(image)) return false;
+    }
+#endif
     return replayed || fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS);
   }
   auto& set = image->relocations;
-  // Pass 0 checks TLS relocations only: nothing to do in tables pass -1 found without one.
   if (g_relocation_pass == 0 && !set.tls) return true;
   // One entry serves every table of the image in this pass, as in the system linker.
   LookupCache cache;
@@ -897,13 +1060,21 @@ bool relocate_image(ImageState* image) {
     if (!collect_writable_ranges(image)) return false;
     targets.begin(writable_end(image));
     set.targets = &targets;
+#if YUKILINKER_FULL
+    set.tls = !image->host && image->has_emutls_controls;
+#else
     set.tls = false;
+#endif
   }
   const bool valid =
       apply_relr_span(image) && apply_packed(image, &cache) &&
       apply_relocation_span(image, image->relocations.rel, image->relocations.rel_bytes, &cache) &&
       apply_relocation_span(image, image->relocations.plt, image->relocations.plt_bytes, &cache);
   set.targets = nullptr;
+#if YUKILINKER_FULL
+  if (g_relocation_pass == -1 && image->passive_emutls && !image->host)
+    image->managed_emutls = true;
+#endif
   // A table pass -1 refused may still hold a TLS relocation past the one it stopped at.
   if (!valid) set.tls = true;
   return valid || fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS);

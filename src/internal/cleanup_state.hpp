@@ -7,7 +7,8 @@
 
 namespace yukilinker::internal {
 
-enum class CleanupState { None, Registered, Pending, Calling, Cleared, Uncertain };
+// WaitingForTls is a DSO cookie whose private callbacks paused before the libc call.
+enum class CleanupState { None, Registered, Pending, WaitingForTls, Calling, Cleared, Uncertain };
 
 // Lives with the resource being released, never in a callback's stack frame.
 // Calling is published before releasing the operation lock. A thread/fork that

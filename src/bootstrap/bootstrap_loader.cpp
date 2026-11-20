@@ -108,7 +108,7 @@ T core_symbol(SoHandle* core, const char* name) {
 bool handoff(SoHandle* core, yukilinker_c_core_take_dependencies take, pid_t process) {
   auto* image = state_of(core);
   if (!image || image->tls.active || image->tls.memory_bytes || image != g_first_image ||
-      image != g_last_image || image->active_calls || image->snapshot_refs || image->lease_refs ||
+      image != g_last_image || image->active_calls() || image->snapshot_refs || image->lease_refs ||
       image->references != 1)
     return false;
   size_t count = 0;

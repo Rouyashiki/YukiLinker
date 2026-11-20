@@ -26,6 +26,31 @@ _Static_assert(sizeof(yukilinker_c_early_packet_header) == 24, "packet header la
 _Static_assert(sizeof(yukilinker_c_early_packet_entry) == 844, "packet entry layout");
 _Static_assert(YUKILINKER_C_EARLY_PACKET_VERSION == 3, "packet wire version");
 
+#if !defined(YUKILINKER_TEST_CFI)
+static void check_private_key_scope(yukilinker_c_runtime* runtime, const char* directory) {
+  yukilinker_c_context* context = yukilinker_c_context_create(runtime, directory, NULL, NULL);
+  assert(context);
+  char path[4096];
+  int length = snprintf(path, sizeof(path), "%s/libkey_consumer.so", directory);
+  assert(length > 0 && (size_t)length < sizeof(path));
+  yukilinker_c_open_options options = {.size = sizeof(options),
+                                       .flags = RTLD_NOW,
+                                       .backend = YUKILINKER_C_BACKEND_PRIVATE,
+                                       .context = context};
+  yukilinker_c_handle handle = yukilinker_c_open_path(runtime, path, &options, NULL);
+  assert(handle.generation);
+  yukilinker_c_lookup_result symbol =
+      yukilinker_c_lookup(runtime, handle, "fixture_key_bindings", NULL);
+  assert(symbol.found && symbol.address);
+  int (*bindings)(void);
+  memcpy(&bindings, &symbol.address, sizeof(bindings));
+  assert(bindings());
+  assert(yukilinker_c_close(runtime, handle).info.private_mapping_unmapped);
+  assert(yukilinker_c_context_destroy(runtime, context));
+  puts("PASS private pthread key versions and weak imports");
+}
+#endif
+
 __attribute__((visibility("default"))) int yukilinker_test_run(const char* directory) {
   assert(yukilinker_c_abi_version() == 1);
   assert(yukilinker_c_has_feature(YUKILINKER_C_FEATURE_RUNTIME_OWNER));
@@ -74,6 +99,7 @@ __attribute__((visibility("default"))) int yukilinker_test_run(const char* direc
     assert(yukilinker_c_query(runtime, handle, &info) == YUKILINKER_C_INVALID_HANDLE);
   }
 #if !defined(YUKILINKER_TEST_CFI)
+  check_private_key_scope(runtime, directory);
   options.backend = YUKILINKER_C_BACKEND_PRIVATE;
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   assert(fd >= 0);

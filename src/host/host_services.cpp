@@ -157,7 +157,7 @@ void host_fork_hook(uint32_t phase) {
   if (services.fork_hook == nullptr) return;
   // module_fork calls the hook from a host-call frame that dropped the operation lock, before the
   // fork locks are taken and after they are given back. This frame only counts the call.
-  CallbackGuard callback_scope(nullptr, true);
+  CallbackGuard callback_scope(nullptr, CallbackGuard::Code::Host, true);
   services.fork_hook(services.user, phase);
 }
 

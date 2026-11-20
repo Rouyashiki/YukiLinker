@@ -28,7 +28,7 @@ set_target_properties(core PROPERTIES C_STANDARD 11 CXX_STANDARD 17
 target_compile_definitions(core PRIVATE YUKILINKER_TEST_SHARED=1)
 target_compile_options(core PRIVATE -UNDEBUG)
 if(YUKILINKER_CONSUMER_LANGUAGE STREQUAL "CXX")
-  target_link_options(core PRIVATE -Wl,--wrap=munmap)
+  target_link_options(core PRIVATE -Wl,--wrap=munmap,--wrap=pthread_setspecific)
   if(YUKILINKER_CONSUMER_NOEXCEPT)
     target_compile_options(core PRIVATE -fno-exceptions -fno-rtti)
     target_compile_definitions(core PRIVATE YUKILINKER_TEST_NOEXCEPT=1)

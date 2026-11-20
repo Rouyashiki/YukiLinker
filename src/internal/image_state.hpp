@@ -42,10 +42,21 @@ struct Dependency {
   bool apply_open_flags = false;
   // Resolved through one of the namespace's links, so it never takes the open's flags.
   bool linked = false;
+#if YUKILINKER_FULL
+  // Index of a control bound across this PRIVATE edge when either image is trusted.
+  uint32_t emutls_control = 0;
+#endif
 };
 
 #if YUKILINKER_FULL
 struct ExitCallback;
+
+struct NativeEmutlsControl {
+  uint32_t symbol;
+  const ImageState* provider;
+  uintptr_t address;
+  NativeEmutlsControl* next;
+};
 #endif  // #if YUKILINKER_FULL
 
 // Private dependencies load recursively, one level per DT_NEEDED step, and every level holds a
@@ -107,7 +118,11 @@ struct ImageState {
   // (committed) when the open returns the handle, or revoked with the reference when it fails or
   // its thread ends inside it. A close consumes committed references only.
   size_t pending_references = 0;
-  size_t active_calls = 0;
+  // Both kinds pin the image. Only TLS destructor calls on vanished threads can be discarded
+  // when deciding whether a parked close can resume after fork.
+  size_t non_tls_calls = 0;
+  size_t tls_destructor_calls = 0;
+  size_t active_calls() const { return non_tls_calls + tls_destructor_calls; }
   size_t snapshot_refs = 0;
   size_t lease_refs = 0;
   size_t execution_leases = 0;
@@ -132,15 +147,15 @@ struct ImageState {
   bool marked = false;
   // Set on each Closing image as collection's free loop starts; cleared once the loop visits it.
   bool retire_pending = false;
-  // The collection pass that made it Closing, until that pass frees or keeps it; 0 otherwise.
+  // The collection pass that began or resumed retirement, until that pass frees or keeps it.
   uint64_t closing_pass = 0;
   // Set once relocation pass 2 reaches the image. An image has one pass 2, so it is never cleared.
   bool pass2_started = false;
   bool linked = false;
   bool host = false;
   bool executed = false;
-  // Set on every member of a group that ran no code while the failure sweep of its open releases
-  // it (dlopen_memfd_offset). The phase stays, so other threads still wait for that open.
+  // Seals the image against new observers and private key values through unmap and dependency
+  // close. A failed-open sweep also sets this without changing the phase that waiters observe.
   bool releasing = false;
   // A CLEANUP_FAILURE event was recorded for its reservation: a dead copy retried by every
   // collection reports the failure once, not once per retry, so the event ring keeps the rest.
@@ -162,8 +177,37 @@ struct ImageState {
   ImageState* next = nullptr;
 #if YUKILINKER_FULL
   ExitCallback* exit_callbacks = nullptr;
+  // Pass -1 determines whether this image's emutls accesses relocate to the Core. A directly
+  // bound compiler-rt has its own control-index space even when it exports a weak accessor.
+  bool has_rebindable_emutls_accessor = false;
+  bool has_local_emutls_accessor = false;
+  bool managed_emutls = false;
+  bool has_emutls_controls = false;
+  // Defines controls without its own accessor or a relocation that uses a control.
+  bool passive_emutls = false;
+  bool mixed_emutls_accessors = false;
+  // Keep the Core dependency even when another relocation binds a different accessor.
+  bool binds_core_emutls = false;
+  // A trusted image cannot transfer a relocation or a lookup that still calls a Core wrapper.
+  bool binds_core_wrapper = false;
+  // A private IFUNC has not yet supplied the address for at least one accessor relocation.
+  bool deferred_emutls_accessor = false;
+  // Dependency references keep each relocated native control and its provider live.
+  NativeEmutlsControl* native_emutls_controls = nullptr;
+  // Managed images redirect this definition to Core. Native callers keep the relocated address.
+  void* emutls_accessor_provider = nullptr;
 #endif  // #if YUKILINKER_FULL
 };
+
+#if YUKILINKER_FULL
+// Self-bound controls are always in scope. Across images, Core can supply a shared control
+// even when a trusted image bound its accessor through an ordinary PRIVATE dependency.
+inline bool shares_emutls_accessor(const ImageState* caller, const ImageState* owner) {
+  const auto core = reinterpret_cast<void*>(yuki_emutls_get_address);
+  return owner && (caller == owner ||
+                   (bound_emutls_accessor(caller) == core && bound_emutls_accessor(owner) == core));
+}
+#endif
 
 // An open is still loading it: some of its constructors have not run.
 // The references a close may consume: those whose open has returned.

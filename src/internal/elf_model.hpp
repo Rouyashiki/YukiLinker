@@ -96,10 +96,10 @@ struct Lifecycle {
   // twice. The image's __cxa_atexit callbacks come last, each unlinked before it runs.
   bool finalizing = false;
   size_t fini_steps_left = 0;
-  // A run is under way, on fini_thread; another run (process exit, a collection) waits its turn.
-  // A thread that ends inside a step, or a fork child without that thread, clears it.
-  bool fini_running = false;
+  // One thread owns the finalizer cursor across unlocked callbacks. The thread consuming
+  // Bionic's exit entry may be a different one. An active close then finishes the same cursor.
   pthread_t fini_thread{};
+  pthread_t process_exit_thread{};
   // A usual CRT needs one cookie, without a separate allocation. Reentrant or
   // multiple-cookie finalization uses metadata nodes that outlive the mapping.
   DsoCleanup dso_cleanup;
@@ -186,8 +186,8 @@ struct RelocationSet {
   // The range the last relocation wrote into, checked first by the next one. Only the loading
   // thread relocates an image.
   size_t writable_hint = 0;
-  // Pass -1 found a TLS relocation, or has not run. Pass 0 checks only those, so an image whose
-  // tables pass -1 found without one skips it.
+  // Pass 0 checks ELF TLS relocations and emutls control bindings. Pass -1 clears this if an
+  // image needs neither check.
   bool tls = true;
   DeferredRelocation* deferred = nullptr;
   size_t deferred_count = 0;

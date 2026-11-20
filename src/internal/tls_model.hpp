@@ -48,6 +48,40 @@ struct TlsTemplate {
 struct ThreadTlsState;
 
 #if YUKILINKER_FULL
+// Clang's emulated TLS ABI is four target words. Compiler-rt owns the third word when its own
+// accessor is bound. The Core keeps its keys outside the mapped control, including after reload.
+struct EmutlsControl {
+  uintptr_t size;
+  uintptr_t alignment;
+  uintptr_t index;
+  const void* initial;
+};
+static_assert(sizeof(EmutlsControl) == 4 * sizeof(void*));
+void* bound_emutls_accessor(const ImageState* image);
+bool validate_emutls_controls(ImageState* image);
+
+struct EmutlsBlock {
+  const EmutlsControl* control = nullptr;
+  ImageState* owner = nullptr;
+  uint64_t generation = 0;
+  void* storage = nullptr;
+  EmutlsBlock* next = nullptr;
+};
+
+// An interrupted warm lookup can still be reading a previous table after a signal handler
+// grows it. Keep all tables and blocks until thread exit. A forced detach clears the block's
+// generation before releasing the image; readers never follow its owner.
+struct EmutlsTable {
+  size_t capacity;
+  size_t used;
+  EmutlsTable* retired;
+  EmutlsBlock* blocks;
+  EmutlsBlock** slots() { return reinterpret_cast<EmutlsBlock**>(this + 1); }
+};
+
+extern "C" void* yuki_emutls_get_address(const EmutlsControl* control);
+constexpr char kEmutlsAccessor[] = "__emutls_get_address";
+
 struct TlsDescriptorIndex {
   uintptr_t module;
   uintptr_t offset;
@@ -75,8 +109,12 @@ struct ThreadBlockTable {
 };
 struct ThreadExitRecord;
 struct ThreadTlsState {
+  pid_t tid = 0;
+  uintptr_t identity = 0;
   ThreadBlockTable* blocks = nullptr;
   ThreadTlsBlock* first = nullptr;
+  EmutlsTable* emutls = nullptr;
+  bool emutls_deferred = false;
   ThreadExitRecord* destructors = nullptr;
   ThreadTlsState* next = nullptr;
 };
@@ -114,7 +152,11 @@ extern bool g_tls_stopped;
 // Faults stay deliverable because the kernel would force a blocked one to
 // its default action, past every handler.
 struct ScopedSignalBlocker {
-  ScopedSignalBlocker() {
+  explicit ScopedSignalBlocker(bool enable = true) {
+    if (enable) block();
+  }
+  void block() {
+    if (active) return;
     // The kernel numbers signals from one. The first application RT signal is a
     // property of the running Bionic, which reserves some of the low RT signals.
     constexpr uint64_t ordinary = (uint64_t{1} << (__SIGRTMIN - 1)) - 1;
@@ -131,14 +173,21 @@ struct ScopedSignalBlocker {
     static_assert(sizeof(set) == sizeof(bits));
     memcpy(&set, &bits, sizeof(set));
     change_mask(SIG_BLOCK, &set, &old);
+    active = true;
   }
-  ~ScopedSignalBlocker() { change_mask(SIG_SETMASK, &old, nullptr); }
+  void restore() {
+    if (!active) return;
+    change_mask(SIG_SETMASK, &old, nullptr);
+    active = false;
+  }
+  ~ScopedSignalBlocker() { restore(); }
   ScopedSignalBlocker(const ScopedSignalBlocker&) = delete;
   ScopedSignalBlocker& operator=(const ScopedSignalBlocker&) = delete;
   ScopedSignalBlocker(ScopedSignalBlocker&&) = delete;
   ScopedSignalBlocker& operator=(ScopedSignalBlocker&&) = delete;
 
  private:
+  bool active = false;
   sigset64_t old;
   static void change_mask(int how, const sigset64_t* set, sigset64_t* previous) {
     // The kernel accepts the full mask on both pointer widths. Oreo's 32-bit

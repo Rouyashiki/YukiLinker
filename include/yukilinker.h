@@ -854,6 +854,9 @@ YUKILINKER_C_API uint32_t yukilinker_c_forget(yukilinker_c_runtime* runtime,
 
 /* Error code: OK transfers a Ready trusted image mapping to the caller and invalidates
  * the handle, leaving the mapping intact. Refuses while used/pinned/referenced elsewhere.
+ * Delete PRIVATE pthread keys with destructors in this image before handoff. An image that
+ * binds Core pthread key wrappers, uses Core emutls storage or imports ordinary PRIVATE
+ * emutls controls remains owned by Core and must be closed normally.
  * Dependencies are closed by this operation; bootstrap uses its separate dependency-transfer
  * protocol. The receiving host must ultimately retire the mapping and all its callbacks. */
 YUKILINKER_C_API uint32_t yukilinker_c_release_host(yukilinker_c_runtime* runtime,
@@ -937,12 +940,18 @@ YUKILINKER_C_API int yukilinker_c_iterate_images(yukilinker_c_runtime* runtime,
                                                  yukilinker_c_namespace* scope,
                                                  yukilinker_c_image_visitor visitor, void* user);
 
-/* Controlled fork brackets; nest only on the same thread and pair with after_fork.
- * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
+/* Controlled fork brackets supplement the runtime atfork handlers. Nest them on the same thread.
+ * On Android 9+, initialize PRIVATE C++ thread-local objects with destructors used by atfork
+ * handlers on the forking thread before fork, or quiesce system linker operations through fork.
+ * If the child needs a host-owned pthread_once control being initialized on another thread,
+ * let that initializer finish before fork.
+ * If the child will use locally bound PRIVATE emutls, stop new calls that may first-touch
+ * its TLS and drain in-flight calls before prepare_fork. Keep those callers quiescent
+ * through fork so the child inherits the module's compiler-rt index mutex unlocked. */
 YUKILINKER_C_API void yukilinker_c_prepare_fork(yukilinker_c_runtime* runtime);
 
-/* Controlled fork brackets; nest only on the same thread and pair with after_fork.
- * These supplement the runtime atfork handlers and cannot restart a retired runtime. */
+/* Pair each prepare_fork with after_fork in both processes. Pass a nonzero child flag in
+ * the child and zero in the parent. A retired runtime stays retired. */
 YUKILINKER_C_API void yukilinker_c_after_fork(yukilinker_c_runtime* runtime, int child);
 
 /* Best-effort host diagnostic only; does not release ownership or execute private module code. */

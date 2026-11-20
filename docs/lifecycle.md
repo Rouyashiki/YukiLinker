@@ -70,8 +70,13 @@ The loader claim includes process identity. A fork child rejects inherited
 incomplete handoff and checks descriptor identity during cleanup so a reused
 fd number retains its current resource.
 
-Coordinate host activity, call `prepare_fork`, fork, then call `after_fork` in
-both processes with the corresponding child flag. Destroy runtime before
+If the child will use a PRIVATE module's locally bound compiler-rt, stop new
+calls that may first-touch its TLS and drain in-flight calls before
+`prepare_fork`. Include workers, callbacks and thread-exit destructors. Keep
+them quiescent through fork so the child inherits the module's index mutex
+unlocked. The forking thread must also be outside that critical section.
+Call `prepare_fork`, fork, then call `after_fork` in both processes with the
+corresponding child flag before resuming work. Destroy runtime before
 unloading Core so TLS keys and libc callback registrations can retire while
 their code is still callable.
 

@@ -52,8 +52,8 @@ struct Context {
   bool strict_private = false;
 };
 
-// Whether context is under an explicit retirement: nothing may be added to it (an image, a
-// reference, a pin, a namespace, a link). Read under the operation lock.
+// Explicit retirement closes external admission. Its own finalizers may still acquire TLS
+// while their images are mapped. Read under the operation lock.
 static inline bool context_sealed(const Context* context) {
   return context != nullptr && context->retirement != Retirement::kOpen;
 }

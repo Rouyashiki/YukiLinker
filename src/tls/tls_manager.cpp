@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include "../internal/enumeration.hpp"
+#if YUKILINKER_FULL
+#include "../internal/private_pthread_keys.hpp"
+#endif
 #include "../internal/runtime_model.hpp"
 
 namespace yukilinker::internal {
 
 #if YUKILINKER_FULL
+// This libc ABI is available throughout the supported API range. Bind it with the Core
+// so registering a destructor never needs a symbol lookup from an atfork handler.
+extern "C" int __cxa_thread_atexit_impl(void (*)(void*), void*, void*);
 namespace {
 
 // Under the mask, or by the owning thread's lock-free path.
@@ -89,23 +96,18 @@ void collect_unpinned() {
   (void)collect_images();
 }
 
-// The one place a state goes, under the operation lock with signals blocked. Frees a thread's
-// state with its records, blocks and tables. True when that dropped the last pin of an image that
-// collection may now retire. A record still linked here never runs: the key destructor runs after
-// Bionic's only __cxa_thread_finalize pass, and every other caller passes a state without
-// records. So the record goes with its pin, as Bionic drops a later registration.
-bool release_thread_tls_state(ThreadTlsState* state) {
-  if (state == nullptr) return false;
+// With signals blocked. A callback can register another destructor before returning,
+// so the completed record need not still be at the head.
+void release_registered_destructor(ThreadExitRecord* record) {
+  auto** link = &record->thread->destructors;
+  while (*link != record) link = &(*link)->next;
+  *link = record->next;
+  --record->owner->thread_destructors;
+  free_object(record);
+}
+
+bool release_native_thread_storage(ThreadTlsState* state) {
   bool unpinned = false;
-  for (ThreadExitRecord* record = state->destructors; record != nullptr;) {
-    ThreadExitRecord* next = record->next;
-    ImageState* owner = record->owner;
-    --owner->thread_destructors;
-    unpinned |= unpinned_image(owner);
-    free_object(record);
-    record = next;
-  }
-  state->destructors = nullptr;
   ThreadTlsBlock* block = state->first;
   while (block != nullptr) {
     ThreadTlsBlock* next = block->next;
@@ -118,21 +120,44 @@ bool release_thread_tls_state(ThreadTlsState* state) {
     free_object(block);
     block = next;
   }
-  auto** link = &g_thread_states;
-  while (*link && *link != state) link = &(*link)->next;
-  if (*link) *link = state->next;
+  state->first = nullptr;
   free_block_tables(state);
-  free_object(state);
   return unpinned;
 }
 
-// The state a finalizer made for this thread after the key was cleared, taken off the key so that
-// only the caller frees it. Null if there is none.
-ThreadTlsState* take_fresh_thread_tls_state() {
-  if (!__atomic_load_n(&g_thread_tls_key_valid, __ATOMIC_ACQUIRE)) return nullptr;
-  auto* state = static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key));
-  if (state != nullptr) (void)pthread_setspecific(g_thread_tls_key, nullptr);
-  return state;
+// Called under the operation lock with signals blocked, including when discarding a vanished
+// thread after fork. No key or destructor of the vanished thread is invoked.
+bool release_thread_tls_state(ThreadTlsState* state) {
+  if (state == nullptr) return false;
+  bool unpinned = release_native_thread_storage(state);
+  // A live thread releases each record after its Bionic callback returns. An exited thread
+  // or one lost at fork can leave pending records, including a callback interrupted by fork.
+  while (auto* record = state->destructors) {
+    auto* owner = record->owner;
+    release_registered_destructor(record);
+    unpinned |= unpinned_image(owner);
+  }
+  if (auto* table = state->emutls) {
+    while (auto* block = table->blocks) {
+      table->blocks = block->next;
+      if (block->owner) {
+        --block->owner->tls_users;
+        unpinned |= unpinned_image(block->owner);
+      }
+      free(block->storage);
+      free_object(block);
+    }
+    while (table) {
+      auto* retired = table->retired;
+      free(table);
+      table = retired;
+    }
+  }
+  auto** link = &g_thread_states;
+  while (*link && *link != state) link = &(*link)->next;
+  if (*link) *link = state->next;
+  free_object(state);
+  return unpinned;
 }
 
 // Collections one thread exit runs at most. Each one that leaves a fresh state behind ran a
@@ -141,36 +166,54 @@ constexpr size_t kThreadExitCollections = 64;
 
 // The TLS key's destructor. Bionic runs it in pthread_key_clean_all, after the thread's
 // thread_local destructors, with the key cleared. A finalizer that a collection runs here and
-// that touches TLS makes a fresh state. Bionic would release it in its next round, but it stops
-// after PTHREAD_DESTRUCTOR_ITERATIONS (4) rounds, and a state left then would hold shutdown off
-// for good. So each fresh state is released here, and collected after, until none appears.
+// that touches TLS makes a fresh state. Pending C++ or managed key callbacks keep their storage.
+// Otherwise drain native blocks and give new emutls blocks one turn of Bionic's other destructors.
+// A state left after the last round can be reaped once the thread exits.
 void thread_tls_key_destructor(void* opaque) {
   OperationGuard operation;
   auto* state = static_cast<ThreadTlsState*>(opaque);
   for (size_t collections = 0;; ++collections) {
     bool unpinned;
+    bool deferred;
     {
       // Bionic frees a thread's TLS with signals blocked; the lock is waited for with the
       // thread's own mask, as every operation waits.
       ScopedSignalBlocker signals;
-      if (collections != 0) state = take_fresh_thread_tls_state();
+      if (!__atomic_load_n(&g_thread_tls_key_valid, __ATOMIC_ACQUIRE)) return;
+      auto* armed = static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key));
+      if (collections != 0) state = armed;
       if (state == nullptr) return;
-      unpinned = release_thread_tls_state(state);
+      // Late C++ cleanup can run from exit(). A managed key destructor can also pass existing
+      // TLS to a key due in a later round, without allocating a block or extending its grace.
+      const bool callbacks = state->destructors || current_thread_has_private_key_callbacks();
+      deferred = callbacks || (state->emutls && !state->emutls_deferred);
+      if (deferred) {
+        // A finalizer's fresh state is already armed. For the state Bionic passed in, restore
+        // its key if possible. Even if that fails, its storage stays live until thread exit.
+        if (!armed) (void)pthread_setspecific(g_thread_tls_key, state);
+        if (callbacks) return;
+        state->emutls_deferred = true;
+        unpinned = release_native_thread_storage(state);
+      } else {
+        if (armed == state && pthread_setspecific(g_thread_tls_key, nullptr) != 0) return;
+        unpinned = release_thread_tls_state(state);
+      }
     }
     if (!unpinned) return;
     if (collections == kThreadExitCollections) {
-      // The state is gone; what it pinned waits for the next collection, on any thread.
+      // Any image just unpinned waits for the next collection, on any thread.
       host_log_error("yukilinker: thread exit left images for a later collection");
       return;
     }
-    // Unmasked, since finalizers run here; the freed state is not touched again.
+    // Finalizers run with the thread's own signal mask and may create a fresh state.
     collect_unpinned();
+    if (deferred) return;
   }
 }
 
 }  // namespace
 
-// Shutdown, the fork child and an empty state's release free a state here, without collecting.
+// Shutdown, fork recovery, exited-thread reaping and an empty state's release free it here.
 void destroy_thread_tls_state(void* opaque) {
   auto* state = static_cast<ThreadTlsState*>(opaque);
   if (state == nullptr) return;
@@ -184,10 +227,13 @@ bool ensure_thread_tls_key() {
   pthread_mutex_lock(&g_key_mutex);
   if (!g_thread_tls_key_valid && !g_keys_retired) {
     const int error = pthread_key_create(&g_thread_tls_key, thread_tls_key_destructor);
-    if (error == 0)
-      __atomic_store_n(&g_thread_tls_key_valid, true, __ATOMIC_RELEASE);
-    else
+    if (error != 0) {
       errno = error;
+    } else if (ensure_thread_identity_key()) {
+      __atomic_store_n(&g_thread_tls_key_valid, true, __ATOMIC_RELEASE);
+    } else {
+      pthread_key_delete(g_thread_tls_key);
+    }
   }
   const bool valid = g_thread_tls_key_valid;
   pthread_mutex_unlock(&g_key_mutex);
@@ -204,8 +250,21 @@ ThreadTlsState* thread_tls_state(bool* created) {
   ScopedSignalBlocker signals;
   state = static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key));
   if (state != nullptr) return state;
+  // Bionic clears a key before calling its destructor. A signal in that interval must still
+  // see this thread's original blocks. The upcoming destructor owns the state until it releases
+  // it or rearms the key. Its identity key has no destructor and remains readable in that gap.
+  uintptr_t identity = current_thread_identity(false);
+  if (identity) {
+    for (state = g_thread_states; state; state = state->next)
+      if (state->identity == identity) return state;
+  } else {
+    identity = current_thread_identity(true);
+    if (!identity) return nullptr;
+  }
   state = allocate_object<ThreadTlsState>();
   if (state == nullptr) return nullptr;
+  state->tid = gettid();
+  state->identity = identity;
   if (pthread_setspecific(g_thread_tls_key, state) != 0) {
     free_object(state);
     return nullptr;
@@ -216,12 +275,11 @@ ThreadTlsState* thread_tls_state(bool* created) {
   return state;
 }
 
-// A state can go this way while one of its thread destructors runs (run_thread_destructor unlinks
-// the record before the callback); nothing may use record->thread after that callback.
 void release_empty_thread_tls_state(ThreadTlsState* state) {
   // A handler on this thread must not add a block between the test and the free.
   ScopedSignalBlocker signals;
-  if (state == nullptr || state->first != nullptr || state->destructors != nullptr ||
+  if (state == nullptr || state->first != nullptr || state->emutls ||
+      state->destructors != nullptr ||
       !__atomic_load_n(&g_thread_tls_key_valid, __ATOMIC_ACQUIRE) ||
       pthread_getspecific(g_thread_tls_key) != state)
     return;
@@ -292,6 +350,7 @@ ThreadTlsBlock* create_thread_block(const TlsTemplate& tls) {
   block->module_id = tls.module_id;
   block->owner = tls.image;
   ++block->owner->tls_users;
+  retain_tls_dependencies(block->owner);
   return block;
 }
 
@@ -301,6 +360,7 @@ bool reset_thread_block(ThreadTlsBlock* block, const TlsTemplate& tls) {
   if (block->owner && block->owner->tls_users) --block->owner->tls_users;
   block->owner = tls.image;
   ++block->owner->tls_users;
+  retain_tls_dependencies(block->owner);
   // Only a stale block is reset, so a lookup this interrupts fails its generation compare and
   // never uses the old storage, which goes last.
   void* old_storage = block->storage;
@@ -314,6 +374,9 @@ bool reset_thread_block(ThreadTlsBlock* block, const TlsTemplate& tls) {
 
 bool activate_tls(ImageState* image) {
   TlsTemplate& tls = image->tls;
+  // An initial emutls access may run inside prepare_fork, while its thread holds g_key_mutex.
+  if (image->managed_emutls && !ensure_thread_tls_key())
+    return fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_METADATA);
   if (tls.memory_bytes == 0) return true;
   if (tls.file_bytes > tls.memory_bytes || !is_power_of_two(tls.alignment == 0 ? 1 : tls.alignment))
     return false;
@@ -376,6 +439,14 @@ void detach_image_tls_blocks(ImageState* image) {
   ScopedSignalBlocker signals;
   pthread_mutex_lock(&g_tls_mutex);
   for (ThreadTlsState* thread = g_thread_states; thread != nullptr; thread = thread->next) {
+    if (auto* table = thread->emutls) {
+      for (auto* block = table->blocks; block; block = block->next) {
+        if (block->owner != image) continue;
+        __atomic_store_n(&block->generation, uint64_t{0}, __ATOMIC_RELEASE);
+        block->owner = nullptr;
+        --image->tls_users;
+      }
+    }
     for (ThreadTlsBlock* block = thread->first; block != nullptr; block = block->next) {
       if (block->owner != image) continue;
       block->owner = nullptr;
@@ -439,6 +510,189 @@ extern "C" void* yuki_tls_get_addr(TlsIndex* index) {
   return address != nullptr ? address : tls_get_addr_slow(*index);
 }
 
+namespace {
+bool emutls_template(ImageState* owner, const EmutlsControl* control, TlsTemplate* object) {
+  const auto offset =
+      reinterpret_cast<uintptr_t>(control) - reinterpret_cast<uintptr_t>(owner->memory.bias);
+  if (!runtime_pointer<EmutlsControl>(owner, offset) ||
+      __atomic_load_n(&control->index, __ATOMIC_ACQUIRE) != 0 ||
+      (control->alignment && !is_power_of_two(control->alignment)))
+    return false;
+  object->memory_bytes = std::max(uintptr_t{1}, control->size);
+  object->alignment = control->alignment;
+  if (control->initial && control->size) {
+    auto* source = caller_image(const_cast<void*>(control->initial));
+    if (!source || source->releasing ||
+        !runtime_pointer<uint8_t>(source,
+                                  reinterpret_cast<uintptr_t>(control->initial) -
+                                      reinterpret_cast<uintptr_t>(source->memory.bias),
+                                  control->size))
+      return false;
+    object->initial_bytes = control->initial;
+    object->file_bytes = control->size;
+  }
+  return true;
+}
+}  // namespace
+
+void* bound_emutls_accessor(const ImageState* image) {
+  if (!image || image->mixed_emutls_accessors || image->deferred_emutls_accessor) return nullptr;
+  return image->managed_emutls ? reinterpret_cast<void*>(yuki_emutls_get_address)
+                               : image->emutls_accessor_provider;
+}
+
+// Exported controls are known after relocation and can be checked before any private code runs.
+// A local control has no dynamic symbol in a stripped DSO and receives the same check on use.
+bool validate_emutls_controls(ImageState* image) {
+  // A directly callable name or version of the native accessor would keep using compiler-rt
+  // even if another relocation in the same image bound to Core.
+  if (image->binds_core_emutls &&
+      (image->has_local_emutls_accessor || image->mixed_emutls_accessors ||
+       image->deferred_emutls_accessor))
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, kEmutlsAccessor);
+  if (!image->host && !image->has_emutls_controls) return true;
+  const auto refuse_control = [image](uint32_t index) {
+    const auto& symbol = image->symbols.entries[index];
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS,
+                string_at(image, symbol.st_name),
+                symbol_version(image, index, symbol.st_shndx == SHN_UNDEF));
+  };
+  void* accessor = bound_emutls_accessor(image);
+  const bool may_use_core = image->binds_core_emutls || image->deferred_emutls_accessor;
+  if (image->native_emutls_controls && (may_use_core || image->mixed_emutls_accessors))
+    return refuse_control(image->native_emutls_controls->symbol);
+  for (auto* edge = image->dependencies; edge; edge = edge->next) {
+    if (!edge->emutls_control) continue;
+    auto* provider = edge->image;
+    // A fully native trusted group keeps its native bindings. A mixed group must agree
+    // on a known accessor in either import direction before any private IFUNC runs.
+    if (image->host && provider && provider->host && !image->mixed_emutls_accessors &&
+        !provider->mixed_emutls_accessors && !may_use_core && !provider->binds_core_emutls &&
+        !provider->deferred_emutls_accessor)
+      continue;
+    if (!accessor || accessor != bound_emutls_accessor(provider))
+      return refuse_control(edge->emutls_control);
+  }
+  if (accessor != reinterpret_cast<void*>(yuki_emutls_get_address)) return true;
+  if (image->host && !ensure_thread_tls_key())
+    return fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_METADATA);
+  for (size_t i = 0; i < image->symbols.count; ++i) {
+    const auto& symbol = image->symbols.entries[i];
+    const char* name = string_at(image, symbol.st_name);
+    if (symbol.st_shndx == SHN_UNDEF || !name || strncmp(name, "__emutls_v.", 11) != 0) continue;
+    auto* control = runtime_pointer<EmutlsControl>(image, symbol.st_value);
+    TlsTemplate object;
+    if (symbol.st_shndx == SHN_ABS || ELF64_ST_TYPE(symbol.st_info) != STT_OBJECT ||
+        symbol.st_size < sizeof(EmutlsControl) || !control ||
+        !emutls_template(image, control, &object))
+      return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_RELOCATIONS, name);
+  }
+  return true;
+}
+
+namespace {
+size_t emutls_hash(const EmutlsControl* control) {
+  const auto word = reinterpret_cast<uintptr_t>(control) / alignof(EmutlsControl);
+  return word ^ (word >> 5) ^ (word >> 11);
+}
+
+// Half-full at most. Return the block and, for insertion, the matching or first unused slot.
+EmutlsBlock* find_emutls_block(EmutlsTable* table, const EmutlsControl* control, size_t* slot) {
+  if (!table) return nullptr;
+  const size_t mask = table->capacity - 1;
+  for (size_t i = emutls_hash(control) & mask;; i = (i + 1) & mask) {
+    auto* block = __atomic_load_n(&table->slots()[i], __ATOMIC_ACQUIRE);
+    if (!block || block->control == control) {
+      if (slot) *slot = i;
+      return block;
+    }
+  }
+}
+
+EmutlsTable* grow_emutls_table(EmutlsTable* old) {
+  size_t capacity = 8;
+  if (old) {
+    size_t live = 0;
+    for (size_t i = 0; i < old->capacity; ++i) {
+      auto* block = old->slots()[i];
+      if (block && block->generation) ++live;
+    }
+    // Rehash without doubling when detached dead blocks pushed occupancy to the threshold.
+    capacity = live >= old->capacity / 4 ? old->capacity * 2 : old->capacity;
+  }
+  size_t bytes;
+  if (multiply_overflow(capacity, sizeof(EmutlsBlock*), &bytes) ||
+      add_overflow(bytes, sizeof(EmutlsTable), &bytes))
+    abort();
+  auto* table = static_cast<EmutlsTable*>(calloc(1, bytes));
+  if (!table) abort();
+  table->capacity = capacity;
+  table->retired = old;
+  if (old) {
+    table->blocks = old->blocks;
+    for (size_t i = 0; i < old->capacity; ++i) {
+      auto* block = old->slots()[i];
+      if (!block || !block->generation) continue;
+      size_t slot;
+      find_emutls_block(table, block->control, &slot);
+      table->slots()[slot] = block;
+      ++table->used;
+    }
+  }
+  return table;
+}
+
+// The control identifies its defining image after ELF interposition. Compiler-generated callers
+// have no allocation failure return. The Core never publishes an index in the control.
+__attribute__((noinline)) void* emutls_address_slow(const EmutlsControl* control) {
+  OperationGuard operation;
+  ScopedSignalBlocker signals;
+  ThreadTlsState* thread = thread_tls_state();
+  if (!thread) abort();
+  // A signal handler may have published this control since the first lookup.
+  auto* table = thread->emutls;
+  size_t slot;
+  auto* previous = find_emutls_block(table, control, &slot);
+  if (previous && previous->generation) return previous->storage;
+  auto* owner = caller_image(const_cast<EmutlsControl*>(control));
+  TlsTemplate object;
+  if (bound_emutls_accessor(owner) != reinterpret_cast<void*>(yuki_emutls_get_address) ||
+      !admits_private_tls(owner) || !emutls_template(owner, control, &object))
+    abort();
+  if (!table || (!previous && table->used >= table->capacity / 2)) {
+    table = grow_emutls_table(table);
+    __atomic_store_n(&thread->emutls, table, __ATOMIC_RELEASE);
+    find_emutls_block(table, control, &slot);
+  }
+  auto* block = allocate_object<EmutlsBlock>();
+  if (!block) abort();
+  void* storage = allocate_thread_storage(object);
+  if (!storage) abort();
+  *block = {control, owner, owner->generation, storage, table->blocks};
+  table->blocks = block;
+  // Another key destructor can publish this address after our first cleanup pass. Give all
+  // blocks in the table a full pass after the most recent allocation.
+  thread->emutls_deferred = false;
+  if (!previous) ++table->used;
+  ++owner->tls_users;
+  retain_tls_dependencies(owner);
+  __atomic_store_n(&table->slots()[slot], block, __ATOMIC_RELEASE);
+  return storage;
+}
+}  // namespace
+
+extern "C" void* yuki_emutls_get_address(const EmutlsControl* control) {
+  if (__atomic_load_n(&g_thread_tls_key_valid, __ATOMIC_ACQUIRE)) {
+    auto* thread = static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key));
+    if (thread) {
+      auto* table = __atomic_load_n(&thread->emutls, __ATOMIC_ACQUIRE);
+      auto* block = find_emutls_block(table, control, nullptr);
+      if (block && __atomic_load_n(&block->generation, __ATOMIC_ACQUIRE)) return block->storage;
+    }
+  }
+  return emutls_address_slow(control);
+}
+
 #if defined(__i386__)
 extern "C" __attribute__((regparm(1))) void* yuki_tls_get_addr_i386(TlsIndex* index) {
   return yuki_tls_get_addr(index);
@@ -449,27 +703,30 @@ void run_thread_destructor(void* opaque) {
   OperationGuard operation;
   auto* record = static_cast<ThreadExitRecord*>(opaque);
   ImageState* owner = record->owner;
-  auto** link = &record->thread->destructors;
-  while (*link && *link != record) link = &(*link)->next;
-  if (*link) *link = record->next;
-  // The callback may release record->thread (an emptied state); do not use it afterwards.
+  // Keep the record linked across the unlocked callback. A fork on another thread must
+  // be able to drop this pin in the child, even though the callback there will never return.
   {
-    CallbackGuard callback_scope(owner);
-    callback_scope.runs_image_code = true;
+    CallbackGuard callback_scope(owner, CallbackGuard::Code::TlsDestructor);
     call_module(record->function, record->argument);
   }
-  --owner->thread_destructors;
-  free_object(record);
   // Bionic's __cxa_thread_finalize runs this as the thread exits, before the key destructors and
-  // with no loader lock held. The pin kept owner alive up to the decrement.
-  if (unpinned_image(owner)) collect_unpinned();
+  // with no loader lock held. Check the owner before a signal can collect the unpinned image.
+  bool unpinned;
+  {
+    ScopedSignalBlocker signals;
+    release_registered_destructor(record);
+    unpinned = unpinned_image(owner);
+  }
+  if (unpinned) collect_unpinned();
 }
 
 int module_thread_atexit(void (*function)(void*), void* argument, void* dso) {
   OperationGuard operation;
+  // An earlier host atfork prepare can initialize a C++ TLS object. Owner lookup needs the
+  // registry mutex, and Bionic registration can reenter Core with the operation lock dropped.
+  ScopedForkUnlock fork_locks;
   auto* owner = find_exit_owner(dso);
-  // A refused call creates no state for this thread. A context under retirement gains no pin.
-  if (!owner || !function || context_sealed(owner->context)) return -1;
+  if (!owner || !function || !admits_private_tls(owner)) return -1;
   bool created = false;
   auto* thread = thread_tls_state(&created);
   if (!thread) return -1;
@@ -479,29 +736,24 @@ int module_thread_atexit(void (*function)(void*), void* argument, void* dso) {
     return -1;
   }
   // Pinned and linked before the lock drops, so a collection or a fork child accounts for it.
-  *record = {function, argument, owner, thread, thread->destructors};
-  ++owner->thread_destructors;
-  thread->destructors = record;
+  {
+    ScopedSignalBlocker signals;
+    *record = {function, argument, owner, thread, thread->destructors};
+    ++owner->thread_destructors;
+    retain_tls_dependencies(owner);
+    thread->destructors = record;
+  }
   int status = -1;
   {
-    // libc's registration takes Bionic's g_dl_mutex, which a dl_iterate_phdr callback may hold
-    // while it waits for this lock: run it as a host call, without the lock.
+    // Bionic versions that pin the anchor take the linker mutex. A linker callback can
+    // reenter Core, so release the operation lock across registration.
     CallbackGuard host_scope(nullptr);
-    void* symbol = nullptr;
-    if (host_dlsym(RTLD_DEFAULT, "__cxa_thread_atexit_impl", nullptr, &symbol) && symbol) {
-      using Register = int (*)(void (*)(void*), void*, void*);
-      // Bionic requires a system-owned anchor; the private image is pinned above.
-      status = reinterpret_cast<Register>(symbol)(run_thread_destructor, record,
-                                                  reinterpret_cast<void*>(&pthread_self));
-    }
+    status = __cxa_thread_atexit_impl(run_thread_destructor, record,
+                                      reinterpret_cast<void*>(&pthread_self));
   }
   if (status == 0) return 0;
-  // A nested registration may have linked its own record above this one.
-  auto** link = &thread->destructors;
-  while (*link && *link != record) link = &(*link)->next;
-  if (*link) *link = record->next;
-  --owner->thread_destructors;
-  free_object(record);
+  ScopedSignalBlocker signals;
+  release_registered_destructor(record);
   // Only a state this call made: an older one may be in use by a read a handler interrupted.
   if (created) release_empty_thread_tls_state(thread);
   return -1;

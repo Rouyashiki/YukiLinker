@@ -23,9 +23,12 @@ bool validate_bootstrap_core(ImageState* image);
 bool parse_dynamic_tags(ImageState* image, size_t dynamic_index, DynamicParse* parse);
 bool establish_symbol_count(ImageState* image, const DynamicParse& parse);
 bool validate_versions(ImageState* image);
-// The first symbol that needs the process's own unwinder, C++ ABI or CFI runtime ("" for an
-// unreadable name), or null.
-const char* requires_system_runtime(const ImageState* image);
+#if YUKILINKER_FULL
+bool rebindable_emutls_accessor(const ImageState* image, const ElfW(Sym) & symbol);
+#endif
+// Classifies emutls accessors and controls. Returns the first symbol that needs a system runtime
+// ("" for an unreadable name), or null.
+const char* classify_runtime_symbols(ImageState* image);
 const char* string_at(const ImageState* image, size_t offset);
 // The Verneed after need in its chain, which validate_versions checked: inside the image, aligned.
 const ElfW(Verneed) * next_verneed(ImageState* image, const ElfW(Verneed) * need);
@@ -69,6 +72,10 @@ LinkResolution resolve_through_links(ImageState* requester, const char* name, in
 #endif  // #if YUKILINKER_FULL
 
 SymbolResolution materialize_defined_symbol(ImageState* image, const ElfW(Sym) & symbol);
+inline SymbolResolution materialize_target(const SymbolTarget& target) {
+  return target.image ? materialize_defined_symbol(target.image, *target.symbol)
+                      : SymbolResolution{reinterpret_cast<uintptr_t>(target.address), true};
+}
 SymbolTarget search_scope(ImageState* root, const char* name, const char* version,
                           GlobalLookup globals, ImageState* after = nullptr);
 // Visits, in search_scope's order without its global pass, every private image a lookup through

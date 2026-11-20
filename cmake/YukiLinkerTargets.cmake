@@ -70,6 +70,7 @@ set(YUKILINKER_RUNTIME_SOURCES
   src/enumeration/phdr_bridge.cpp
   src/enumeration/program_headers.cpp
   src/registry/registry.cpp
+  src/tls/private_pthread_keys.cpp
   ${YUKILINKER_ARCH_SOURCES})
 
 # The two integration routes use exactly the same source list and build settings.

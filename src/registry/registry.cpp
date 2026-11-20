@@ -84,7 +84,7 @@ void fill_image_record(const ImageState* image, yukilinker_c_image_record* recor
   record->open_references = image->references;
   record->tls_references = image->tls_users;
   record->destructor_references = image->thread_destructors;
-  record->callback_references = image->active_calls;
+  record->callback_references = image->active_calls();
   record->snapshot_references = image->snapshot_refs;
   record->lease_references = image->lease_refs;
   record->execution_leases = image->execution_leases;

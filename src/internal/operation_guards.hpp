@@ -27,10 +27,9 @@ extern bool g_collecting;
 // A collection asked for while one is under way; that one makes another pass. Each pass clears
 // it as it starts, so it means something only while g_collecting is set.
 extern bool g_collect_again;
-// Numbers collection passes; an image a pass makes Closing carries the number (closing_pass).
+// Numbers collection passes; an image a pass begins or resumes retiring carries its number.
 extern uint64_t g_collection_pass;
-// An image the collection under way made Closing in its current pass and has neither freed nor
-// kept yet.
+// An image the current pass is retiring and has neither freed nor kept yet.
 static inline bool retiring_image(const ImageState* image) {
   return image->phase == Phase::Closing && g_collecting && image->closing_pass == g_collection_pass;
 }
@@ -51,6 +50,7 @@ extern pthread_mutex_t g_key_mutex;
 extern bool g_keys_retired;
 // Whether api_prepare_fork took the locks: the keys can come into being before api_after_fork.
 extern bool g_fork_locked;
+void recover_early_fork_child();
 extern bool g_operation_depth_valid;
 extern size_t g_active_operations;
 // The admissions among g_active_operations still waiting in operation_lock for the mutex. They
@@ -118,6 +118,8 @@ static inline bool store_operation_key(uintptr_t value) {
          pthread_setspecific(g_operation_depth_key, reinterpret_cast<void*>(value)) == 0;
 }
 static inline void operation_lock() {
+  // An earlier child handler may enter Core before our atfork handler runs.
+  if (__atomic_load_n(&g_fork_locked, __ATOMIC_ACQUIRE)) recover_early_fork_child();
   // Admission before waiter: a reader that sees the waiter (sole_holder) sees the admission too.
   // An uncontended lock needs neither the waiter count nor the key's record of the wait.
   if (pthread_mutex_trylock(&g_operation_mutex) == 0) {
@@ -218,7 +220,7 @@ struct LoadWaiter {
   // Kept alive while the lock is dropped; a fork child gives the context's count back.
   Context* context;
   LoadWaiter* next;
-  // The image the wait keeps (active_calls), or null; a thread that ends in the wait gives it
+  // The image the wait keeps, or null; a thread that ends in the wait gives it
   // back (abandon_callback_frames).
   ImageState* caller = nullptr;
 };
@@ -238,17 +240,8 @@ static inline bool awaited_image(const ImageState* image) {
   return image_loading(image) || closing_elsewhere(image);
 }
 #endif
-// This thread's collection is retiring it and has not begun to unmap it: the finalizers of this
-// pass run on this thread meanwhile.
-static inline bool retiring_here(const ImageState* image) {
-#if YUKILINKER_FULL
-  return retiring_image(image) && !image->releasing &&
-         pthread_equal(g_collecting_thread, pthread_self());
-#else
-  (void)image;
-  return false;
-#endif
-}
+// A PRIVATE finalizer on this thread may still look up the image's mapped symbols.
+bool retiring_here(const ImageState* image);
 struct OperationGuard {
   OperationGuard() {
 #if YUKILINKER_FULL
@@ -266,6 +259,23 @@ struct OperationGuard {
   OperationGuard& operator=(OperationGuard&&) = delete;
 };
 
+#if YUKILINKER_FULL
+// A nested operation that must call Bionic or wait for a PRIVATE initializer in an earlier
+// host atfork handler.
+// Its caller holds an operation admission throughout the suspension and restoration.
+struct ScopedForkUnlock {
+  ScopedForkUnlock();
+  ~ScopedForkUnlock();
+  ScopedForkUnlock(const ScopedForkUnlock&) = delete;
+  ScopedForkUnlock& operator=(const ScopedForkUnlock&) = delete;
+
+ private:
+  bool suspended;
+  bool by_handler;
+  unsigned brackets;
+};
+#endif
+
 // Keep admissions counted while module code runs without the mutation lock. `keep_lock` leaves
 // the lock and this thread's depth alone, which is what the fork child path needs: there the
 // mutex has just been reinitialized and the thread must stay the runtime's only occupant.
@@ -275,10 +285,10 @@ struct OperationGuard {
 // a frame neither saves, clears nor restores it.
 struct CallbackGuard {
   ImageState* image;
-  // The frame runs image's own code (a constructor, a destructor, a resolver, a callback), as
-  // opposed to a host call made on its behalf. A call that image's code makes inside such a frame
-  // is covered by it (CallerCall), since the frame ends only once that code has returned.
-  bool runs_image_code = false;
+  // Image frames cover calls back into Core until the image code returns (CallerCall).
+  // A TLS destructor may also look up its still-live dependency group during a paused close.
+  enum class Code : uint8_t { Host, Image, TlsDestructor };
+  Code code;
   // A CallerCall's marker (CallerCall::frame): no callback, no lock dropped, no active call; it
   // only lets abandon_callback_frames give the call's caller_calls back.
   bool caller_call = false;
@@ -296,11 +306,15 @@ struct CallbackGuard {
   // before_release is an internal, nonblocking state transition. It runs only
   // after the callback frame and lock-depth save both succeeded, with the lock
   // still held; it must not invoke host code or acquire another lock.
-  explicit CallbackGuard(ImageState* owner, bool keep_lock = false,
+  explicit CallbackGuard(ImageState* owner, Code kind = Code::Host, bool keep_lock = false,
                          void (*before_release)(ImageState*, void*) = nullptr,
                          void* argument = nullptr)
-      : image(owner) {
-    if (image) ++image->active_calls;
+      : image(owner), code(kind) {
+#if YUKILINKER_FULL
+    // Child recovery rebuilds pins from the published frames. A signal may fork on this thread.
+    ScopedSignalBlocker signals(code == Code::TlsDestructor);
+#endif
+    if (image) ++active_counter();
 #if YUKILINKER_FULL
     if (keep_lock) {
       kept_lock = true;
@@ -312,6 +326,12 @@ struct CallbackGuard {
                    ? static_cast<CallbackGuard*>(pthread_getspecific(g_callback_key))
                    : nullptr;
     linked = g_operation_depth_valid && pthread_setspecific(g_callback_key, this) == 0;
+    if (!linked && code == Code::TlsDestructor) {
+      // The thread's destructor record still pins the image. Keep the lock for this callback.
+      if (image) --active_counter();
+      image = nullptr;
+      return;
+    }
     if (before_release && !linked) return;
     // A depth of 0 leaves no lock to drop, unless the keys are gone: then every depth reads 0 and
     // an operation keeps the lock throughout.
@@ -319,8 +339,11 @@ struct CallbackGuard {
     // The depth goes to 0; a wait of an interrupted operation_lock stays recorded. The lock is
     // dropped only once the key says so: a key that kept the depth would have this thread's nested
     // operations unlock a mutex it no longer holds.
-    if (g_operation_depth_valid && !store_operation_key(operation_key_value() & ~kDepthMask))
+    if (g_operation_depth_valid && !store_operation_key(operation_key_value() & ~kDepthMask)) {
+      // Fork recovery already counts the lock levels that stayed in the operation key.
+      depth = 0;
       return;
+    }
     saved_state = true;
     if (before_release) before_release(image, argument);
     held.put_aside();
@@ -331,8 +354,9 @@ struct CallbackGuard {
   }
   ~CallbackGuard() {
 #if YUKILINKER_FULL
+    ScopedSignalBlocker signals(code == Code::TlsDestructor);
     if (kept_lock) {
-      if (image) --image->active_calls;
+      if (image) --active_counter();
       return;
     }
     if (saved_state) {
@@ -346,7 +370,10 @@ struct CallbackGuard {
     }
     if (linked) (void)pthread_setspecific(g_callback_key, previous);
 #endif
-    if (image) --image->active_calls;
+    if (image) --active_counter();
+  }
+  size_t& active_counter() const {
+    return code == Code::TlsDestructor ? image->tls_destructor_calls : image->non_tls_calls;
   }
   CallbackGuard(const CallbackGuard&) = delete;
   CallbackGuard& operator=(const CallbackGuard&) = delete;
@@ -358,8 +385,7 @@ struct CallbackGuard {
 // caller found by the return address or a caller stub. While it is in the runtime it counts in
 // caller_calls, so a collection that finds the image held then keeps it with a return-address hold:
 // the code that made the call runs on after it returns. Inside a frame of this thread that runs the
-// same image's code (runs_image_code), the call is part of that frame, which returns only after the
-// image's code has; it counts nothing then.
+// same image's code, the frame already covers the call until the image returns.
 //
 // The call is linked on the thread's callback chain as a marker frame (caller_call), so a thread
 // that ends inside it (a pthread_exit from a callback the call ran) gives its count back in
@@ -377,7 +403,7 @@ struct CallerCall {
     }
     auto* top = static_cast<CallbackGuard*>(pthread_getspecific(g_callback_key));
     for (const CallbackGuard* frame = top; frame; frame = frame->previous)
-      if (!frame->caller_call && frame->image == image && frame->runs_image_code) {
+      if (frame->image == image && frame->code != CallbackGuard::Code::Host) {
         image = nullptr;
         return;
       }
@@ -421,7 +447,55 @@ struct CallerCall {
   CallerCall& operator=(CallerCall&&) = delete;
 };
 
+// Once Bionic consumes the exit entry, the thread running the finalizers can finish the
+// pending destructors while pthread key values still hold the mapping.
+static inline bool finalizing_at_exit_here(const ImageState* image) {
+  return image->lifecycle.process_exit_thread && image->lifecycle.fini_thread &&
+         pthread_equal(image->lifecycle.fini_thread, pthread_self());
+}
+
+// During ordinary retirement both ELF steps and C++ exit callbacks preserve globals
+// reachable from TLS.
+static inline bool finalization_waits_for_tls(const ImageState* image) {
+  return image->phase == Phase::Closing &&
+         (image->tls_users || image->thread_destructors || (g_collecting && image->marked));
+}
+
+// Between ELF steps even an executing callback holds the image. Inside __cxa_finalize the
+// enclosing ELF step itself owns such a frame, so the inner drain checks TLS holds only.
+static inline bool finalization_held(const ImageState* image) {
+  return !image->lifecycle.process_exit_thread &&
+         ((image->phase == Phase::Closing && image->active_calls()) ||
+          finalization_waits_for_tls(image));
+}
+
 #if YUKILINKER_FULL
+void mark_image(ImageState* image);
+bool held_by_running_finalizer(const ImageState* image);
+
+// Collection marked the graph before a finalizer took this pin. Protect its dependencies
+// before the next finalizer and reconsider any pins released before the callback returned.
+static inline void retain_tls_dependencies(ImageState* owner) {
+  if (g_collecting && owner->phase == Phase::Closing && !owner->marked) {
+    mark_image(owner);
+    g_collect_again = true;
+  }
+}
+
+static inline bool admits_private_tls(const ImageState* owner) {
+  // A failed munmap leaves a mapping for retry after its global objects have been destroyed.
+  if (owner->releasing || (owner->lifecycle.finalizing && !owner->lifecycle.initialized))
+    return false;
+  if (!context_sealed(owner->context)) return true;
+  if (!g_operation_depth_valid) return false;
+  for (auto* frame = static_cast<const CallbackGuard*>(pthread_getspecific(g_callback_key)); frame;
+       frame = frame->previous)
+    if (frame->code != CallbackGuard::Code::Host && frame->image &&
+        frame->image->context == owner->context)
+      return true;
+  return held_by_running_finalizer(owner);
+}
+
 // Whether a callback frame of this thread is open: a CallerCall's marker is none.
 static inline bool callback_frame_open() {
   if (!g_operation_depth_valid) return false;
@@ -452,9 +526,10 @@ struct CreateScope {
 
 // Track iterator pins so a child created from a callback can restore them. In the full runtime a
 // private dl_iterate_phdr's snapshot (waitable) is also on g_active_snapshots, so a close on
-// another thread can wait for the iteration that keeps its image (collect_after_close). Each guard
-// is placed at the start of a calloc block that also holds `images`, never on the stack: a thread
-// that ends inside the iteration leaves it linked, and abandon_snapshots frees it.
+// another thread can wait for the iteration that keeps its image (collect_after_close).
+// Heap-allocated guards start a calloc block that also holds `images` and are freed by
+// abandon_snapshots when a thread exits inside them. Stack-resident guards set heap_allocated
+// to false so abandon_snapshots unpins them without calling free().
 struct SnapshotGuard {
   ImageState** images;
   size_t count;
@@ -463,24 +538,27 @@ struct SnapshotGuard {
   pthread_t thread;
   SnapshotGuard* next_active = nullptr;
   bool waitable;
+  bool heap_allocated;
   // A close ran while this outermost snapshot was active: collect once it ends.
   bool collect_after = false;
   // The snapshot key holds this guard: only then does the destructor put the previous one back.
   bool linked = false;
 #endif
-  SnapshotGuard(ImageState** snapshot, size_t size, bool wait_for = false)
+  SnapshotGuard(ImageState** snapshot, size_t size, bool wait_for = false, bool heap = true)
       : images(snapshot),
         count(size)
 #if YUKILINKER_FULL
         ,
-        previous(g_operation_depth_valid
+        previous(size && g_operation_depth_valid
                      ? static_cast<SnapshotGuard*>(pthread_getspecific(g_snapshot_key))
                      : nullptr),
         thread(pthread_self()),
-        waitable(wait_for)
+        waitable(wait_for),
+        heap_allocated(heap)
 #endif
   {
-    for (size_t i = 0; i < count; ++i) ++images[i]->active_calls;
+    if (!count) return;
+    for (size_t i = 0; i < count; ++i) ++images[i]->non_tls_calls;
 #if YUKILINKER_FULL
     linked = g_operation_depth_valid && pthread_setspecific(g_snapshot_key, this) == 0;
     if (waitable) {
@@ -489,10 +567,12 @@ struct SnapshotGuard {
     }
 #else
     (void)wait_for;
+    (void)heap;
 #endif
   }
   ~SnapshotGuard() {
-    for (size_t i = 0; i < count; ++i) --images[i]->active_calls;
+    if (!count) return;
+    for (size_t i = 0; i < count; ++i) --images[i]->non_tls_calls;
 #if YUKILINKER_FULL
     if (linked) (void)pthread_setspecific(g_snapshot_key, previous);
     if (!waitable) return;

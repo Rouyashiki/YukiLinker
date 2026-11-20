@@ -10,6 +10,7 @@
 #include "../internal/host_imports.hpp"
 #endif
 #include "../internal/android_fork_mutex.hpp"
+#include "../internal/private_pthread_keys.hpp"
 #include "../internal/registry.hpp"
 #include "../internal/runtime_model.hpp"
 
@@ -25,6 +26,15 @@ constexpr uint32_t kSupportedOpenFlags =
 
 #if YUKILINKER_FULL
 void publish_refusal(const yukilinker_c_error_detail& error, const OperationRefusal& refusal);
+
+// A missing unversioned import may have been supplied by Core itself during relocation.
+void supply_missing_emutls(SymbolTarget& target, const ImageState* image, const char* name,
+                           const char* version) {
+  if (!target.found && !target.failed && image->managed_emutls && !version && name &&
+      strcmp(name, kEmutlsAccessor) == 0 &&
+      image->emutls_accessor_provider == reinterpret_cast<void*>(yuki_emutls_get_address))
+    target = {nullptr, nullptr, image->emutls_accessor_provider, true};
+}
 #endif
 
 // One operation's error record, and the refusal that decided it. A nested operation (a callback's,
@@ -224,73 +234,223 @@ bool closure_import_mask(ImageState* image, uint32_t* mask) {
 
 // A miss of a private dlsym through a handle, retried through the host imports that its closure
 // bound through: the address a relocation would have bound.
-bool lookup_closure_import(ImageState* image, const char* name, const char* version,
-                           LookupValue* result) {
+SymbolTarget lookup_closure_import(ImageState* image, const char* name, const char* version) {
+  SymbolTarget failure;
+  failure.failed = true;
   uint32_t mask = 0;
   if (!closure_import_mask(image, &mask)) {
     // Never the whole context instead: a handle sees only what its scope bound.
     fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_METADATA, name, version);
-    return true;
+    return failure;
   }
-  if (mask == 0) return false;
+  if (mask == 0) return {};
   const HostImportResult imported = lookup_host_import(image->context, image, mask, name, version);
   // NO_MEMORY is recorded already.
-  if (imported.failed) return true;
+  if (imported.failed) return failure;
   if (imported.refused) {
     fail_refused(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, imported.reason, imported.library,
                  name, version);
-    return true;
+    return failure;
   }
-  if (!imported.found) return false;
-  result->address = imported.address;
-  result->found = 1;
-  return true;
+  return {nullptr, nullptr, imported.address, imported.found};
 }
 
 }  // namespace
 #endif  // #if defined(YUKILINKER_RUNTIME)
 
-LookupValue loader_lookup_impl(void* handle, const char* name, const char* version) {
-  OperationGuard operation;
+namespace {
+SymbolTarget handle_target(ImageState* image, const char* name, const char* version) {
+  auto target = search_scope(image, name, version, GlobalLookup::None);
+#if defined(YUKILINKER_RUNTIME)
+  if (!target.found && !target.failed) target = lookup_closure_import(image, name, version);
+#endif
+#if YUKILINKER_FULL
+  supply_missing_emutls(target, image, name, version);
+#endif
+  return target;
+}
+
+SymbolResolution handle_address(ImageState* image, const SymbolTarget& target, const char* name) {
+#if YUKILINKER_FULL
+  // A private IFUNC can reenter close while materializing its address.
+  void* provider = strcmp(name, kEmutlsAccessor) == 0 && image->managed_emutls
+                       ? image->emutls_accessor_provider
+                       : nullptr;
+#endif
+  auto value = materialize_target(target);
+#if YUKILINKER_FULL
+  if (provider && value.address == reinterpret_cast<uintptr_t>(provider))
+    value.address = reinterpret_cast<uintptr_t>(yuki_emutls_get_address);
+#else
+  (void)image;
+  (void)name;
+#endif
+  return value;
+}
+
+#if YUKILINKER_FULL
+// On LP32 RTLD_NEXT has the private-token tag. Test the pseudo-handles before decoding tokens.
+bool pseudo_handle(const void* handle) { return handle == RTLD_DEFAULT || handle == RTLD_NEXT; }
+
+SymbolTarget pseudo_target(ImageState* caller, void* handle, const char* name,
+                           const char* version) {
+  auto target = search_scope(caller->load_root, name, version, GlobalLookup::Dynamic,
+                             handle == RTLD_NEXT ? caller : nullptr);
+  // The system load order around a PRIVATE caller is unknown. Only RTLD_DEFAULT falls back.
+  if (target.found || target.failed || handle == RTLD_NEXT) return target;
+  if (caller->namespace_id == 0) {
+    CallbackGuard callback(caller);
+    void* address = nullptr;
+    if (host_dlsym(RTLD_DEFAULT, name, version, &address)) return {nullptr, nullptr, address, true};
+  }
+#if defined(YUKILINKER_RUNTIME)
+  const auto imported = lookup_host_import(caller->context, caller, UINT32_MAX, name, version);
+  if (imported.refused)
+    fail_refused(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, imported.reason, imported.library,
+                 name, version);
+  target = {nullptr, nullptr, imported.address, imported.found,
+            imported.failed || imported.refused};
+#endif
+  supply_missing_emutls(target, caller, name, version);
+  return target;
+}
+
+bool lookup_control_compatible(ImageState* image, void* handle, const SymbolTarget& control,
+                               const char* name, const char* version) {
+  auto* owner = control.image;
+  if (owner && (ELF64_ST_TYPE(control.symbol->st_info) != STT_OBJECT ||
+                owner->mixed_emutls_accessors || owner->deferred_emutls_accessor))
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+  const bool native_import = !owner || (owner != image && owner->host && owner->passive_emutls);
+  if (native_import) {
+    // A passive trusted provider has no accessor to compare. As with a system control,
+    // use the reader's actual relocation and compare its native accessor in this scope.
+    const auto value = materialize_target(control);
+    if (!value.valid) return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_METADATA, name, version);
+    auto* binding = image->native_emutls_controls;
+    while (binding && (binding->provider != owner || binding->address != value.address))
+      binding = binding->next;
+    if (!binding || !bound_emutls_accessor(image) || image->binds_core_emutls)
+      return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+  }
+  // System lookups and IFUNCs can reenter close. Check generations before using the original
+  // scope or control again, even if a new copy has taken the same address.
+  const uint64_t scope_generation = image->generation;
+  const uint64_t control_generation = owner ? owner->generation : 0;
+  const auto accessor = pseudo_handle(handle)
+                            ? pseudo_target(image, handle, kEmutlsAccessor, nullptr)
+                            : handle_target(image, kEmutlsAccessor, nullptr);
+  if (accessor.failed) return false;
+  image = image_by_generation(scope_generation);
+  if (!image) return fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA, name, version);
+  void* address = nullptr;
+  if (accessor.found) {
+    if (accessor.image && accessor.image->phase == Phase::Preparing)
+      return fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA, name, version);
+    if (accessor.image && ELF64_ST_TYPE(accessor.symbol->st_info) != STT_FUNC &&
+        ELF64_ST_TYPE(accessor.symbol->st_info) != STT_GNU_IFUNC)
+      return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+    const auto value = handle_address(image, accessor, kEmutlsAccessor);
+    if (!value.valid) return fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_METADATA, kEmutlsAccessor);
+    address = reinterpret_cast<void*>(value.address);
+  }
+  image = image_by_generation(scope_generation);
+  if (!image || (!accessible_image(image) && !retiring_here(image)))
+    return fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA, name, version);
+  if (control_generation) {
+    owner = image_by_generation(control_generation);
+    if (!owner || (!accessible_image(owner) && !retiring_here(owner)))
+      return fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA, name, version);
+  }
+  if (native_import)
+    return (address && address == bound_emutls_accessor(image)) ||
+           fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+  // A hidden local accessor can still use its own control.
+  if (!accessor.found)
+    return shares_emutls_accessor(image, owner) ||
+           fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+  void* expected = bound_emutls_accessor(owner);
+  const bool compatible = expected ? address == expected : caller_image(address) == owner;
+  return compatible || fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, name, version);
+}
+#endif
+}  // namespace
+
+LookupValue lookup_locked(void* handle, const char* name, const char* version, ImageState* caller) {
   LookupValue result{};
   ErrorScope scope(&result.error, nullptr, true);
-  if (exit_cleanup_uncertain()) {
-    fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT);
-    return result;
-  }
-  auto* image = state_of(static_cast<SoHandle*>(handle));
-  if (!image || !name || !accessible_image(image) ||
-      (private_token(handle) && !image->references)) {
+  if (!name) {
     fail(YUKILINKER_C_INVALID_HANDLE, YUKILINKER_C_METADATA);
     return result;
   }
-  // Only the loading thread's callbacks reach an image still preparing. It is not relocated, and
-  // until pass 1 its text is not even executable, so no address of it leaves and no resolver runs.
-  if (image->phase == Phase::Preparing) {
-    fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA);
-    return result;
-  }
-  auto target = search_scope(image, name, version, GlobalLookup::None);
-#if defined(YUKILINKER_RUNTIME)
-  if (!target.found && !target.failed && lookup_closure_import(image, name, version, &result))
-    return result;
+  auto* image = caller;
+  SymbolTarget target;
+#if YUKILINKER_FULL
+  if (caller && pseudo_handle(handle)) {
+    if (strcmp(name, arch::kTlsGetAddr) == 0) {
+      // The module IDs in a PRIVATE caller belong to this Core.
+      if (caller->releasing) {
+        fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT, name, version);
+        return result;
+      }
+      caller->binds_core_wrapper = true;
+      result.address = module_api_symbol(name);
+      result.found = 1;
+      return result;
+    }
+    target = pseudo_target(caller, handle, name, version);
+    if (target.image && accessible_image(target.image) && exit_cleanup_uncertain()) {
+      fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT);
+      return result;
+    }
+  } else
 #endif
+  {
+    if (exit_cleanup_uncertain()) {
+      fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT);
+      return result;
+    }
+    image = state_of(static_cast<SoHandle*>(handle));
+    if (!image || !accessible_image(image) || (private_token(handle) && !image->references)) {
+      fail(YUKILINKER_C_INVALID_HANDLE, YUKILINKER_C_METADATA);
+      return result;
+    }
+    if (image->phase == Phase::Preparing) {
+      fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA);
+      return result;
+    }
+    target = handle_target(image, name, version);
+  }
+#if defined(YUKILINKER_RUNTIME)
+  // Modules using a PRIVATE handle share the registry used by their relocations. A host lookup
+  // receives the provider's address, as does a module looking through an explicit system handle.
+  if (caller && target.found && !target.image) {
+    void* address = private_pthread_address(caller, name, target.address);
+    if (address != target.address) {
+      if (caller->releasing) {
+        fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT, name, version);
+        return result;
+      }
+      caller->binds_core_wrapper = true;
+      target.address = address;
+    }
+  }
+#endif
+  if (target.failed) return result;
   if (!target.found) {
     fail(YUKILINKER_C_SYMBOL_MISSING, YUKILINKER_C_METADATA, name, version);
     return result;
   }
-  if (!target.image) {
-    result.address = target.address;
-    result.found = 1;
-    return result;
-  }
   // A cycle's dependency can still be preparing while the image that needs it is relocated.
-  if (target.image->phase == Phase::Preparing) {
+  if (target.image && target.image->phase == Phase::Preparing) {
     fail(YUKILINKER_C_BUSY, YUKILINKER_C_METADATA);
     return result;
   }
 #if YUKILINKER_FULL
-  if (ELF64_ST_TYPE(target.symbol->st_info) == STT_TLS) {
+  if ((target.image || target.address) && !strncmp(name, "__emutls_v.", 11) &&
+      !lookup_control_compatible(image, handle, target, name, version))
+    return result;
+  if (target.image && ELF64_ST_TYPE(target.symbol->st_info) == STT_TLS) {
     TlsIndex index{target.image->tls.module_id, target.symbol->st_value};
     result.address = yuki_tls_get_addr(&index);
     result.found = result.address != nullptr;
@@ -305,7 +465,17 @@ LookupValue loader_lookup_impl(void* handle, const char* name, const char* versi
     return result;
   }
 #endif
-  auto materialized = materialize_defined_symbol(target.image, *target.symbol);
+  auto materialized = handle_address(image, target, name);
+#if YUKILINKER_FULL
+  if (caller && materialized.valid &&
+      materialized.address == reinterpret_cast<uintptr_t>(yuki_emutls_get_address)) {
+    if (caller->releasing) {
+      fail(YUKILINKER_C_BUSY, YUKILINKER_C_RETIREMENT, name, version);
+      return result;
+    }
+    caller->binds_core_wrapper = true;
+  }
+#endif
   result.address = reinterpret_cast<void*>(materialized.address);
   result.found = materialized.valid;
   return result;
@@ -443,9 +613,7 @@ void fork_parent() {
 }
 
 void fork_child() {
-  if (!g_fork_handler_took) return;
-  g_fork_handler_took = false;
-  unlock_after_fork(1);
+  if (g_fork_handler_took) unlock_after_fork(1);
 }
 #endif  // #if YUKILINKER_FULL
 
@@ -480,7 +648,34 @@ void loader_after_fork_impl(int child) {
 }
 
 #if YUKILINKER_FULL
+// A vanished thread's TLS destructor will never return in the child. Its TLS is discarded below.
+// All other in-flight calls must belong to the surviving thread for a parked close to resume.
+bool resumable_close_after_fork(const ImageState* image, const CallbackGuard* frame,
+                                const SnapshotGuard* snapshot) {
+  if (image->phase != Phase::Closing || image->closing_pass || !image->lifecycle.initialized ||
+      image->lifecycle.fini_thread || image->releasing)
+    return false;
+  if (!image->non_tls_calls && !image->caller_calls) return true;
+  size_t active = 0, callers = 0;
+  for (; frame; frame = frame->previous) {
+    if (frame->image != image) continue;
+    if (frame->caller_call)
+      ++callers;
+    else if (frame->code != CallbackGuard::Code::TlsDestructor)
+      ++active;
+  }
+  for (; snapshot; snapshot = snapshot->previous)
+    for (size_t i = 0; i < snapshot->count; ++i) active += snapshot->images[i] == image;
+  return active == image->non_tls_calls && callers == image->caller_calls;
+}
+
 void unlock_after_fork(int child) {
+  ScopedSignalBlocker signals(child != 0);
+  if (child) {
+    // An earlier child handler or signal may already have recovered this fork.
+    if (!fork_locks_mine()) return;
+    g_fork_handler_took = false;
+  }
   __atomic_store_n(&g_fork_locked, false, __ATOMIC_RELEASE);
   __atomic_store_n(&g_fork_owner, pthread_t{}, __ATOMIC_RELAXED);
   // These normal mutexes were acquired by prepare on this very thread. Bionic's
@@ -511,38 +706,40 @@ void unlock_after_fork(int child) {
     modules_after_fork();
 #endif
     size_t admissions = recovered.restored_depth;
+    auto* frames = static_cast<CallbackGuard*>(pthread_getspecific(g_callback_key));
+    auto* snapshots = static_cast<SnapshotGuard*>(pthread_getspecific(g_snapshot_key));
     for (auto* image = g_first_image; image; image = image->next) {
+      const bool paused_close = resumable_close_after_fork(image, frames, snapshots);
       // A finalization another thread was running has nobody left here: the next run resumes it.
-      if (image->lifecycle.fini_running &&
+      if (image->lifecycle.fini_thread &&
           !pthread_equal(image->lifecycle.fini_thread, pthread_self()))
-        image->lifecycle.fini_running = false;
-      image->active_calls = 0;
+        image->lifecycle.fini_thread = {};
+      image->non_tls_calls = 0;
+      image->tls_destructor_calls = 0;
       // The other threads' calls are gone with them; this thread's are counted again below.
       image->caller_calls = 0;
-      // A Closing image of a sealed context stays Closing: the retirement that made it so resumes
-      // in this child (a dead copy now), and runs only the finalizers that had not begun.
-      if (image->phase == Phase::Closing && context_sealed(image->context)) continue;
+      // A paused close or a sealed context resumes only the finalizers that had not begun.
+      if (image->phase == Phase::Closing && (paused_close || context_sealed(image->context)))
+        continue;
       if (image->phase != Phase::Ready && !pthread_equal(image->loading_thread, pthread_self())) {
         image->phase = Phase::Retired;
         image->flags |= RTLD_NODELETE;
         image->nodelete_reasons |= YUKILINKER_C_NODELETE_FORK;
       }
     }
-    for (auto* frame = static_cast<CallbackGuard*>(pthread_getspecific(g_callback_key)); frame;
-         frame = frame->previous) {
+    for (auto* frame = frames; frame; frame = frame->previous) {
       // A call marker holds no admission, only its call's count (none once its call is over).
       if (frame->caller_call) {
         if (frame->image) ++frame->image->caller_calls;
         continue;
       }
       admissions += frame->depth;
-      if (frame->image) ++frame->image->active_calls;
+      if (frame->image) ++frame->active_counter();
     }
     // Only this thread's iterations are left, and only they stay active.
     g_active_snapshots = nullptr;
-    for (auto* snapshot = static_cast<SnapshotGuard*>(pthread_getspecific(g_snapshot_key));
-         snapshot; snapshot = snapshot->previous) {
-      for (size_t i = 0; i < snapshot->count; ++i) ++snapshot->images[i]->active_calls;
+    for (auto* snapshot = snapshots; snapshot; snapshot = snapshot->previous) {
+      for (size_t i = 0; i < snapshot->count; ++i) ++snapshot->images[i]->non_tls_calls;
       if (!snapshot->waitable) continue;
       snapshot->next_active = g_active_snapshots;
       g_active_snapshots = snapshot;
@@ -558,22 +755,18 @@ void unlock_after_fork(int child) {
     __atomic_store_n(&g_active_operations, admissions, __ATOMIC_RELEASE);
     // The threads that waited for the lock are not in the child.
     __atomic_store_n(&g_lock_waiters, size_t{0}, __ATOMIC_RELEASE);
-    auto* current = g_thread_tls_key_valid
-                        ? static_cast<ThreadTlsState*>(pthread_getspecific(g_thread_tls_key))
-                        : nullptr;
+    private_keys_after_fork();
+    const uintptr_t child_identity = current_thread_identity(false);
+    const pid_t child_tid = gettid();
     auto* thread = g_thread_states;
     while (thread) {
       auto* next = thread->next;
-      if (thread != current) {
-        for (auto* record = thread->destructors; record;) {
-          auto* following = record->next;
-          --record->owner->thread_destructors;
-          free_object(record);
-          record = following;
-        }
-        thread->destructors = nullptr;
+      // Bionic may already have cleared the key before entering its destructor on the forking
+      // thread. Its callback still owns that state, even if a signal has created another one.
+      if (thread->identity == child_identity)
+        thread->tid = child_tid;
+      else
         destroy_thread_tls_state(thread);
-      }
       thread = next;
     }
   }
@@ -608,22 +801,37 @@ LoaderStats loader_query_stats_impl() {
 int loader_release_host_impl(void* handle) {
   OperationGuard operation;
   auto* image = state_of(static_cast<SoHandle*>(handle));
+  {
 #if YUKILINKER_FULL
-  // Freeing an image changes the owner: a callback frame may sit inside an open that still holds
-  // a pointer to it, and only a Ready image is past every such open.
-  if (!sole_operation() || (image && image->phase != Phase::Ready)) return 0;
+    ScopedSignalBlocker signals;
 #endif
-  if (g_collecting || !image || !image->host || image->active_calls || image->snapshot_refs ||
-      image->lease_refs || image->tls.active || image->tls_users || image->thread_destructors ||
-      image->references != 1)
-    return 0;
-  for (auto* other = g_first_image; other; other = other->next) {
-    if (other == image) continue;
-    if (other->load_root == image) return 0;
-    for (auto* dep = other->dependencies; dep; dep = dep->next)
-      if (dep->image == image) return 0;
+    if (g_collecting || !image || !image->host || image->active_calls() || image->snapshot_refs ||
+        image->lease_refs || image->tls.active || image->tls_users || image->thread_destructors ||
+        image->references != 1)
+      return 0;
+#if YUKILINKER_FULL
+    // A callback can reenter from an open that still holds this image. Core-owned callback
+    // registrations, storage and control providers must also outlive their users.
+    if (!sole_operation() || image->phase != Phase::Ready || has_private_key_destructor(image) ||
+        image->binds_core_emutls || image->binds_core_wrapper)
+      return 0;
+    for (auto* dep = image->dependencies; dep; dep = dep->next)
+      if (dep->emutls_control && (!dep->image || !dep->image->host)) return 0;
+#endif
+    for (auto* other = g_first_image; other; other = other->next) {
+      if (other == image) continue;
+      if (other->load_root == image) return 0;
+      for (auto* dep = other->dependencies; dep; dep = dep->next)
+        if (dep->image == image) return 0;
+    }
+    // A dependency close calls the host with the lock dropped. Seal registration before
+    // signals or a host callback can acquire this image during handoff.
+    image->releasing = true;
   }
-  if (!close_dependencies(image)) return 0;
+  if (!close_dependencies(image)) {
+    image->releasing = false;
+    return 0;
+  }
   unregister_image(image);
   discard_exit_callbacks(image);
   // The handoff is done, so a metadata page left mapped does not undo it: the page stays counted
@@ -641,6 +849,30 @@ ImageState* caller_image(void* address) {
 }
 
 #if YUKILINKER_FULL
+void recover_early_fork_child() {
+  // pthread_self survives fork, but Bionic's recursive mutex still names the parent's TID.
+  // Complete the ordinary child recovery once, before even trying to acquire that mutex.
+  if (fork_locks_mine() && g_fork_tid != gettid()) unlock_after_fork(1);
+}
+
+ScopedForkUnlock::ScopedForkUnlock() : suspended(fork_locks_mine()) {
+  if (suspended) {
+    ScopedSignalBlocker signals;
+    by_handler = g_fork_by_handler;
+    brackets = g_fork_brackets;
+    unlock_after_fork(0);
+  }
+}
+
+ScopedForkUnlock::~ScopedForkUnlock() {
+  if (suspended) {
+    ScopedSignalBlocker signals;
+    // The enclosing operation keeps the runtime live.
+    (void)lock_for_fork(by_handler);
+    g_fork_brackets = brackets;
+  }
+}
+
 // The runtime's handlers stay with libc until the runtime is terminal or unloaded.
 void remove_fork_handlers() {
   if (!__atomic_exchange_n(&g_fork_handlers, false, __ATOMIC_SEQ_CST)) return;
@@ -1147,10 +1379,6 @@ void* android_dlopen_ext_body(ImageState* caller, const char* name, int flags,
   return handle;
 }
 
-// Bionic's pseudo-handles. On LP32 RTLD_NEXT is 0xfffffffe, which has a private token's low bits;
-// no token equals either (fresh_token).
-bool pseudo_handle(const void* handle) { return handle == RTLD_DEFAULT || handle == RTLD_NEXT; }
-
 void* module_lookup_body(ImageState* caller, void* handle, const char* name, const char* version,
                          bool* failed);
 
@@ -1166,84 +1394,9 @@ void* module_lookup_for(ImageState* caller, void* handle, const char* name, cons
 void* module_lookup_body(ImageState* caller, void* handle, const char* name, const char* version,
                          bool* failed) {
   const bool pseudo = pseudo_handle(handle);
-  if (!pseudo && (private_token(handle) || state_of(static_cast<SoHandle*>(handle)))) {
-    auto result = loader_lookup_impl(handle, name, version);
-    set_dl_error(result.error);
-    *failed = result.error.code != YUKILINKER_C_OK;
-    return result.address;
-  }
-  if (caller && pseudo) {
-    LookupValue result{};
-    // __tls_get_addr is the runtime's here, as a relocation of any private image binds it: the
-    // module ids a private image holds are the runtime's, and the system's function would read
-    // the host's TLS for them. Other names the relocations take over stay the system's for a
-    // lookup by name, as Bionic hands out its own.
-    if (name && strcmp(name, arch::kTlsGetAddr) == 0) {
-      set_dl_error(result.error);
-      return module_api_symbol(name);
-    }
-    auto target = search_scope(caller->load_root, name, version, GlobalLookup::Dynamic,
-                               handle == RTLD_NEXT ? caller : nullptr);
-    if (!target.found && !target.failed && handle == RTLD_DEFAULT && caller->namespace_id == 0) {
-      // Past the private scope comes the system's global group, as for Bionic's dlsym from a
-      // library in the default namespace: the host's RTLD_DEFAULT. RTLD_NEXT never gets there:
-      // the system's load order around the caller is unknown, and one loaded before it is no
-      // next definition. A namespace reaches the system only through its own edges.
-      CallbackGuard callback_scope(caller);
-      void* address = nullptr;
-      if (host_dlsym(RTLD_DEFAULT, name, version, &address))
-        target = {nullptr, nullptr, address, true};
-    }
-#if defined(YUKILINKER_RUNTIME)
-    if (!target.found && !target.failed && handle == RTLD_DEFAULT) {
-      // RTLD_DEFAULT reaches the imports the host listed for the caller's context, every one of
-      // them, as a relocation of any of its images could; in the default context too, past the
-      // host's own RTLD_DEFAULT, so that a relocation and a lookup of one name agree.
-      HostImportResult imported;
-      {
-        // A NO_MEMORY the lookup records goes to this call's own record.
-        ErrorScope scope(&result.error);
-        imported = lookup_host_import(caller->context, caller, UINT32_MAX, name, version);
-      }
-      if (imported.found) {
-        target = {nullptr, nullptr, imported.address, true};
-      } else if (imported.failed) {
-        set_dl_error(result.error);
-        *failed = true;
-        return nullptr;
-      } else if (imported.refused) {
-        {
-          ErrorScope scope(&result.error);
-          fail_refused(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA, imported.reason,
-                       imported.library, name, version);
-        }
-        set_dl_error(result.error);
-        *failed = true;
-        return nullptr;
-      }
-    }
-#endif
-    if (target.found) {
-      if (target.image && !accessible_image(target.image)) {
-        // A non-TLS symbol of an image this thread's collection is retiring (search_scope),
-        // which loader_lookup_impl refuses.
-        const auto materialized = materialize_defined_symbol(target.image, *target.symbol);
-        result.address = reinterpret_cast<void*>(materialized.address);
-        result.found = materialized.valid;
-      } else if (target.image) {
-        result = loader_lookup_impl(target.image->public_handle, name, version);
-      } else {
-        result.address = target.address;
-        result.found = 1;
-      }
-    } else {
-      result.error.code = target.failed ? YUKILINKER_C_NO_MEMORY : YUKILINKER_C_SYMBOL_MISSING;
-      if (!target.failed) {
-        (void)snprintf(result.error.symbol, sizeof(result.error.symbol), "%s", name ? name : "");
-        if (version)
-          (void)snprintf(result.error.version, sizeof(result.error.version), "%s", version);
-      }
-    }
+  if ((pseudo && caller) ||
+      (!pseudo && (private_token(handle) || state_of(static_cast<SoHandle*>(handle))))) {
+    auto result = lookup_locked(handle, name, version, caller);
     set_dl_error(result.error);
     *failed = result.error.code != YUKILINKER_C_OK;
     return result.address;
@@ -1440,7 +1593,7 @@ int module_dlclose_body(void* handle, ImageState* caller) {
   // added to loader_close_impl has to come after the decrement.
   const bool kept = guarded && durably_kept(caller, takes ? target : nullptr);
   bool pin = guarded && !kept && takes && reaches_caller(target, caller, ++g_graph_visit, false);
-  if (caller) ++caller->active_calls;
+  if (caller) ++caller->non_tls_calls;
   auto result = loader_close_impl(handle, &error);
   if (caller) {
     // The finalizers this close ran, or another thread while it dropped the lock, can have let
@@ -1450,7 +1603,7 @@ int module_dlclose_body(void* handle, ImageState* caller) {
       caller->load_root->flags |= RTLD_NODELETE;
       caller->load_root->nodelete_reasons |= YUKILINKER_C_NODELETE_SELF_CLOSE;
     }
-    --caller->active_calls;
+    --caller->non_tls_calls;
   }
   set_dl_error(error);
   return result == YUKILINKER_C_CLOSE_ERROR ? -1 : 0;
@@ -1595,7 +1748,8 @@ void* loader_open_path(const char* path, const LoadOptions* options,
   return loader_open_path_impl(path, options, error);
 }
 LookupValue loader_lookup(void* handle, const char* name, const char* version) {
-  return loader_lookup_impl(handle, name, version);
+  OperationGuard operation;
+  return lookup_locked(handle, name, version, nullptr);
 }
 CloseStatus loader_close(void* handle, yukilinker_c_error_detail* output) {
   return loader_close_impl(handle, output);

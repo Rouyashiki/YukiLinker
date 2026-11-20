@@ -36,7 +36,7 @@ bool cleanup_call(ImageState* image, CleanupCall& call, Invoke invoke,
   bool returned = false;
   {
     CallbackGuard scope(
-        image, false,
+        image, CallbackGuard::Code::Host, false,
         [](ImageState*, void* argument) {
           auto& pending = *static_cast<CleanupCall*>(argument);
           pending.thread = pthread_self();
