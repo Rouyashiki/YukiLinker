@@ -1,6 +1,6 @@
 # Supported configurations
 
-The SDK supports ARM64, ARM32, x86 and x86_64 Android processes on API 31 and
+The SDK supports ARM64, ARM32, x86 and x86_64 Android processes on API 26 and
 newer. Each build handles its native ELF class and machine. The two 32-bit ABIs
 share the v1 public record layouts, including eight-byte alignment for 64-bit
 fields. Runtime page size comes from the host. Libraries use 16 KiB maximum LOAD
@@ -188,8 +188,9 @@ policy can cause refusal with the corresponding error detail.
 
 ## Instrumentation
 
-CFI runtime belongs to its containing system-loaded Core. Compile Core and system
-modules with compatible cross-DSO CFI settings. A CFI runtime refuses PRIVATE
+Cross-DSO CFI requires API 27 or newer, where the NDK exposes the Bionic CFI
+slow path. The CFI runtime belongs to its containing system-loaded Core. Compile
+Core and system modules with compatible cross-DSO CFI settings. A CFI runtime refuses PRIVATE
 loading before execution. Use the ordinary private bootstrap route with its
 matching Core configuration.
 
@@ -199,8 +200,16 @@ on the target Android environment.
 
 ## Validation boundaries
 
+The API 26 builds ran the three Native hosts and the four C/C++ archive and
+source consumers under QEMU user mode on all four ABIs. Both ARM runtimes came
+from the Nexus 5X Android 8.0 factory image OPR6.170623.013 (build 4283548).
+The x86 and x86_64 runtimes came from their respective Android SDK default
+images, revision 1 (build 4931640). The same API 26 executables and modules
+also ran on the API 31 x86 and API 34 ARM Bionic runtimes. These runs exercised
+the Android userspace linker and libc with the Linux host kernel.
+
 Native hosts cover C/C++ consumption, retained cleanup, callback and fork lifetime,
-and actual two-stage unloading. Both x86 ABIs ran all three hosts and the four
+and actual two-stage unloading. Earlier builds on both x86 ABIs ran all three hosts and the four
 C/C++ archive and source consumers in full Android emulators on API 31, 34 and
 36. The 32-bit tests used native x86 Android TV images. The 64-bit tests used
 AOSP images on API 31 and 34 and a Google APIs image on API 36. All six guests

@@ -274,7 +274,10 @@ CORE_EXPORT bool zygisk_bootstrap_finish_handoff(bool required) {
 }
 CORE_EXPORT void zygisk_finalize_loader(int, int) {
   assert(committed && loader);
+  // Admission tests observe the loader's errno. Bionic may change it on a successful dlclose.
+  const int handoff_errno = errno;
   assert(dlclose(loader) == 0);
+  errno = handoff_errno;
   loader = nullptr;
   ++control->finalized;
 }

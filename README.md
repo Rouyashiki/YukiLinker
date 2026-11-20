@@ -1,7 +1,7 @@
 # YukiLinker
 
 An Android ELF loader SDK with a standalone bootstrap and a runtime embedded in
-the consuming Core. It supports C and C++17 callers on Android API 31 and newer
+the consuming Core. It supports C and C++17 callers on Android API 26 and newer
 for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`. SDK version is 1.0.0.
 The C ABI and HostServices version are 1.
 
@@ -20,7 +20,9 @@ add_library(core SHARED core.cpp)
 target_link_libraries(core PRIVATE YukiLinker::runtime)
 ```
 
-Use NDK `30.0.16248370` and API31. PRIVATE loads independently managed ELF images.
+Use NDK `30.0.16248370` and target API 26 to build the SDK for Android 8.0.
+Hosts can select a higher minimum, as YukiZygisk does with API 31.
+PRIVATE loads independently managed ELF images.
 SYSTEM uses Bionic's component and runtime integration. Close outcomes describe
 reference ownership, mapping retention and cleanup failures. C++ owners require
 explicit release.

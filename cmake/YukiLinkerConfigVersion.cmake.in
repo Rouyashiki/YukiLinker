@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Rouyashiki <https://rouyashiki.org>
+
+# find_package can continue to another prefix while it is considering this version file.
+set(_yukilinker_abi "${CMAKE_ANDROID_ARCH_ABI}")
+if(NOT _yukilinker_abi)
+  set(_yukilinker_abi "${ANDROID_ABI}")
+endif()
+if(ANDROID AND _yukilinker_abi)
+  set(_yukilinker_dir "${CMAKE_CURRENT_LIST_DIR}/${_yukilinker_abi}")
+  if(NOT EXISTS "${_yukilinker_dir}/YukiLinkerTargets.cmake")
+    set(PACKAGE_VERSION "@PROJECT_VERSION@ (missing ${_yukilinker_abi})")
+    set(PACKAGE_VERSION_UNSUITABLE TRUE)
+    return()
+  endif()
+  if(EXISTS "${_yukilinker_dir}/android-api.txt")
+    file(STRINGS "${_yukilinker_dir}/android-api.txt" _yukilinker_build_api)
+  else()
+    # An ABI installed by the original SDK can share this prefix.
+    set(_yukilinker_build_api 31)
+  endif()
+  set(_yukilinker_consumer_api "${CMAKE_SYSTEM_VERSION}")
+  if(ANDROID_PLATFORM_LEVEL)
+    set(_yukilinker_consumer_api "${ANDROID_PLATFORM_LEVEL}")
+  endif()
+  if(NOT _yukilinker_build_api MATCHES "^[0-9]+$")
+    set(PACKAGE_VERSION "@PROJECT_VERSION@ (invalid API metadata for ${_yukilinker_abi})")
+    set(PACKAGE_VERSION_UNSUITABLE TRUE)
+    return()
+  endif()
+  if(NOT _yukilinker_consumer_api MATCHES "^[0-9]+$" OR
+     _yukilinker_consumer_api LESS _yukilinker_build_api)
+    set(PACKAGE_VERSION "@PROJECT_VERSION@ (${_yukilinker_abi} requires API ${_yukilinker_build_api})")
+    set(PACKAGE_VERSION_UNSUITABLE TRUE)
+    return()
+  endif()
+endif()
+
+@YUKILINKER_VERSION_FILE@

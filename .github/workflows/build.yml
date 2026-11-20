@@ -18,6 +18,7 @@ jobs:
     strategy:
       matrix:
         abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+        api: [26, 31]
     steps:
       - uses: actions/checkout@v4
       - name: Install NDK
@@ -27,7 +28,7 @@ jobs:
       - name: Build production libraries and Native hosts
         run: |
           android=(-G Ninja "-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake"
-            -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-31)
+            -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-${{ matrix.api }})
           cmake -S . -B out/sdk "${android[@]}"
           cmake --build out/sdk --parallel 4
           cmake --install out/sdk --prefix "$PWD/out/install"
@@ -40,13 +41,35 @@ jobs:
             for language in C CXX; do
               cmake -S tests/consumer -B "out/$form-$language" -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-                -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-31 \
+                -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-${{ matrix.api }} \
                 -DYUKILINKER_RUNTIME_FORM="$form" -DYUKILINKER_CONSUMER_LANGUAGE="$language" \
                 -DYukiLinker_DIR="$PWD/out/install/lib/cmake/YukiLinker"
               cmake --build "out/$form-$language" --target core --parallel 4
             done
           done
+      - name: Consume the API 26 archive from API 31
+        if: matrix.api == 26
+        run: |
+          cmake -S tests/consumer -B out/consumer-31 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI='${{ matrix.abi }}' -DANDROID_PLATFORM=android-31 \
+            -DYUKILINKER_RUNTIME_FORM=archive -DYUKILINKER_CONSUMER_LANGUAGE=CXX \
+            -DYukiLinker_DIR="$PWD/out/install/lib/cmake/YukiLinker"
+          cmake --build out/consumer-31 --target core --parallel 4
+      - name: Find the compatible SDK across installation prefixes
+        if: matrix.api == 31 && matrix.abi == 'arm64-v8a'
+        run: |
+          android=(-G Ninja "-DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake"
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26)
+          cmake -S . -B out/sdk-26 "${android[@]}"
+          cmake --build out/sdk-26 --parallel 4
+          cmake --install out/sdk-26 --prefix "$PWD/out/install-26"
+          cmake -S tests/consumer -B out/search "${android[@]}" \
+            "-DCMAKE_FIND_ROOT_PATH=$PWD/out/install;$PWD/out/install-26"
+          grep -Fxq "YukiLinker_DIR:PATH=$PWD/out/install-26/lib/cmake/YukiLinker" out/search/CMakeCache.txt
+          cmake --build out/search --target core --parallel 4
       - uses: actions/upload-artifact@v4
+        if: matrix.api == 26
         with:
           name: yukilinker-${{ matrix.abi }}
           path: out/install/

@@ -9,6 +9,18 @@ include(cmake/YukiLinkerOptions.cmake)
 if(NOT ANDROID)
   message(FATAL_ERROR "YukiLinker requires an Android NDK toolchain")
 endif()
+# The NDK legacy toolchain sets CMAKE_SYSTEM_VERSION to 1 and exposes the
+# effective target separately. CMake's native Android toolchain uses the former.
+set(YUKILINKER_BUILD_API "${CMAKE_SYSTEM_VERSION}")
+if(ANDROID_PLATFORM_LEVEL)
+  set(YUKILINKER_BUILD_API "${ANDROID_PLATFORM_LEVEL}")
+endif()
+if(YUKILINKER_BUILD_API LESS 26)
+  message(FATAL_ERROR "YukiLinker requires Android API 26 or newer (target API ${YUKILINKER_BUILD_API})")
+endif()
+if(YUKILINKER_CFI AND YUKILINKER_BUILD_API LESS 27)
+  message(FATAL_ERROR "YUKILINKER_CFI requires Android API 27 for the NDK cross-DSO CFI runtime")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +60,9 @@ if(TARGET yukilinker_bootstrap)
 endif()
 install(EXPORT YukiLinkerTargets NAMESPACE YukiLinker::
   DESTINATION ${YUKILINKER_INSTALL_CMAKEDIR}/${CMAKE_ANDROID_ARCH_ABI})
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/android-api.txt" "${YUKILINKER_BUILD_API}\n")
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/android-api.txt"
+  DESTINATION ${YUKILINKER_INSTALL_CMAKEDIR}/${CMAKE_ANDROID_ARCH_ABI})
 
 # install(EXPORT) alone writes only the targets file; without this config
 # find_package(YukiLinker) has nothing to find. The config is the same for every ABI and picks
@@ -59,21 +74,21 @@ configure_package_config_file(
   ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfig.cmake
   INSTALL_DESTINATION ${YUKILINKER_INSTALL_CMAKEDIR})
 write_basic_package_version_file(
-  ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerBasicVersion.cmake
   VERSION ${PROJECT_VERSION}
   COMPATIBILITY SameMajorVersion
   ARCH_INDEPENDENT)
 # CMake's template still writes the producer's pointer size into the check that ARCH_INDEPENDENT
 # skips (an early return() precedes it). Drop that dead code so every ABI installs the same file.
-file(READ ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake YUKILINKER_VERSION_FILE)
+file(READ ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerBasicVersion.cmake YUKILINKER_VERSION_FILE)
 string(FIND "${YUKILINKER_VERSION_FILE}" "# if the installed or the using project don't have"
        YUKILINKER_ARCH_CHECK)
 if(YUKILINKER_ARCH_CHECK GREATER -1)
   string(SUBSTRING "${YUKILINKER_VERSION_FILE}" 0 ${YUKILINKER_ARCH_CHECK}
          YUKILINKER_VERSION_FILE)
-  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake
-       "${YUKILINKER_VERSION_FILE}")
 endif()
+configure_file(cmake/YukiLinkerConfigVersion.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/YukiLinkerConfigVersion.cmake
   DESTINATION ${YUKILINKER_INSTALL_CMAKEDIR})

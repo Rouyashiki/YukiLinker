@@ -1,13 +1,13 @@
 # Build and integrate
 
 Use CMake 3.22 or newer, Ninja and Android NDK `30.0.16248370`. Configure at
-API 31 with `arm64-v8a`, `armeabi-v7a`, `x86` or `x86_64`, using a separate build
+API 26 with `arm64-v8a`, `armeabi-v7a`, `x86` or `x86_64`, using a separate build
 directory for each ABI.
 
 ```sh
 cmake -S . -B out/arm64 -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
 cmake --build out/arm64
 cmake --install out/arm64 --prefix "$PWD/out/install"
 ```
@@ -21,6 +21,12 @@ filename suffix gives the pointer width. The ABI directory identifies the instru
 
 Point `YukiLinker_DIR` at `<prefix>/lib/cmake/YukiLinker` and configure with the
 matching Android toolchain.
+
+The consumer's API level must be at least the one used to build its ABI's
+archive. When several installation prefixes are available, `find_package`
+skips those missing the requested ABI or requiring a newer API. An API 31
+Core can use the API 26 installation directly. Source integration uses the
+Core's selected Android platform.
 
 ```cmake
 cmake_minimum_required(VERSION 3.22)
@@ -55,7 +61,7 @@ attachment or mixed archive/source integration is rejected.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `YUKILINKER_BUILD_BOOTSTRAP` | `ON` | Build the shared Core loader |
-| `YUKILINKER_CFI` | `OFF` | Instrument runtime for a system-loaded CFI Core |
+| `YUKILINKER_CFI` | `OFF` | Instrument runtime for a system-loaded CFI Core (API 27+) |
 | `YUKILINKER_SANITIZER` | empty | Select NDK address, hwaddress, undefined or thread instrumentation |
 
 Apply compatible instrumentation to the containing Core and its system-loaded
@@ -77,6 +83,7 @@ Set `YUKILINKER_RUNTIME_FORM=archive|sources` and
 consumer with `bootstrap_host --system <absolute-core.so> <fixtures>` to check
 Core unloading followed by fork and process-exit cleanup.
 
-CI builds all four ABIs, installs the SDK and compiles the Native hosts and consumers.
+CI builds all four ABIs at API 26 and 31, installs the SDK and compiles the Native hosts
+and consumers. The downloadable archives target API 26.
 Local QEMU execution needs a provisioned Bionic runtime. The NDK supplies link
 stubs for compilation, so provision executable Bionic libraries separately.
