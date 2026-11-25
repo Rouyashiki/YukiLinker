@@ -94,12 +94,13 @@ static inline void report_cleanup_failure() {
 // mappings a process may have, not necessarily of physical memory), anything else an I/O error.
 // The errno is kept with the code. Callers save errno right after the call, before anything else
 // can change it.
-static inline bool fail_errno(uint32_t stage, int error) {
+static inline bool fail_errno(uint32_t stage, int error, const char* symbol = nullptr,
+                              const char* version = nullptr) {
   errno = error;
   return fail(error == EACCES || error == EPERM ? YUKILINKER_C_PERMISSION_DENIED
               : error == ENOMEM                 ? YUKILINKER_C_NO_MEMORY
                                                 : YUKILINKER_C_IO_ERROR,
-              stage);
+              stage, symbol, version);
 }
 
 // A failure that no system call reported (an overflow, a size that does not fit, a check): no

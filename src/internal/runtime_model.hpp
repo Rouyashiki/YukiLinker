@@ -27,6 +27,8 @@
 #include <new>
 #if defined(__aarch64__)
 #include <sys/ifunc.h>
+#elif defined(__riscv) && __riscv_xlen == 64
+#include <sys/hwprobe.h>
 #endif
 #include <unistd.h>
 

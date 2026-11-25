@@ -85,13 +85,25 @@ if(NOT YUKILINKER_CFI)
       -Wl,--exclude-libs,libc++_static.a -Wl,--exclude-libs,libc++abi.a)
     add_dependencies(cpp_host emutls_${form})
   endforeach()
-  find_library(test_shared_cxx c++_shared REQUIRED)
+  if(CMAKE_ANDROID_ARCH_ABI STREQUAL "riscv64")
+    # NDK 30's riscv64 libc++_shared.so uses native ELF TLS and exports no __emutls_get_address.
+    # Supply a page-aligned system provider for the shared-runtime emutls fixtures.
+    add_library(emutls_runtime SHARED module.c)
+    set_target_properties(emutls_runtime PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sdk")
+    target_compile_definitions(emutls_runtime PRIVATE EMUTLS_RUNTIME=1)
+    target_compile_options(emutls_runtime PRIVATE -femulated-tls -fno-exceptions)
+    target_link_options(emutls_runtime PRIVATE -Wl,-z,max-page-size=16384)
+    target_link_libraries(emutls_shared PRIVATE emutls_runtime)
+    add_dependencies(cpp_host emutls_runtime)
+  else()
+    find_library(test_shared_cxx c++_shared REQUIRED)
+    target_link_libraries(emutls_shared PRIVATE "${test_shared_cxx}")
+    # Keep it in the system linker's search path, outside the PRIVATE fixture directory.
+    configure_file("${test_shared_cxx}" sdk/libc++_shared.so COPYONLY)
+  endif()
   target_compile_definitions(emutls_weak PRIVATE EMUTLS_MANAGED_PROBE=1 EMUTLS_SECOND_CONTROL=1)
   target_compile_definitions(emutls_shared PRIVATE EMUTLS_MANAGED_PROBE=1)
-  target_link_libraries(emutls_shared PRIVATE "${test_shared_cxx}")
-  # Keep the matching NDK library in the system linker's test search path,
-  # outside the directory searched for PRIVATE module dependencies.
-  configure_file("${test_shared_cxx}" sdk/libc++_shared.so COPYONLY)
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/emutls_direct.map"
     "TEST_EMUTLS_OLD {};\nTEST_EMUTLS { global: __emutls_get_address; } TEST_EMUTLS_OLD;\n")
   target_compile_definitions(emutls_direct PRIVATE EMUTLS_VERSIONED_PROVIDER=1)
@@ -181,8 +193,20 @@ if(NOT YUKILINKER_CFI)
   target_compile_definitions(emutls_observer PRIVATE EMUTLS_OBSERVER=1)
   target_link_libraries(emutls_observer PRIVATE emutls_weak)
 endif()
-if(CMAKE_ANDROID_ARCH_ABI MATCHES "^x86(_64)?$" AND NOT YUKILINKER_CFI)
-  # The narrow relocation test rewrites symbol relocations in ordinary REL/RELA tables.
+if(CMAKE_ANDROID_ARCH_ABI MATCHES "^(arm64-v8a|riscv64)$" AND NOT YUKILINKER_CFI)
+  add_library(tlsdesc_importer SHARED module.c)
+  add_library(tlsdesc_provider SHARED module.c)
+  target_compile_definitions(tlsdesc_importer PRIVATE TLSDESC_IMPORTER=1)
+  target_compile_definitions(tlsdesc_provider PRIVATE TLSDESC_PROVIDER=1)
+  target_link_options(tlsdesc_provider PRIVATE -Wl,-z,global)
+  foreach(module tlsdesc_importer tlsdesc_provider)
+    target_compile_options(${module} PRIVATE -fno-emulated-tls -fno-stack-protector)
+    target_link_options(${module} PRIVATE -nostdlib -Wl,--as-needed,-z,max-page-size=16384)
+    add_dependencies(cpp_host ${module})
+  endforeach()
+endif()
+if(CMAKE_ANDROID_ARCH_ABI MATCHES "^(x86(_64)?|riscv64)$" AND NOT YUKILINKER_CFI)
+  # The narrow relocation / synthetic rewrite tests modify ordinary REL/RELA tables.
   target_link_options(linker_lifecycle PRIVATE -Wl,--pack-dyn-relocs=relr)
   add_library(linker_x86_calls SHARED x86_call_module.c)
   target_link_libraries(linker_x86_calls PRIVATE dl)
@@ -192,6 +216,20 @@ if(CMAKE_ANDROID_ARCH_ABI MATCHES "^x86(_64)?$" AND NOT YUKILINKER_CFI)
   target_sources(cpp_host PRIVATE x86_calls.cpp)
   target_compile_definitions(cpp_host PRIVATE YUKILINKER_TEST_X86_CALLS=1)
   add_dependencies(cpp_host linker_x86_calls)
+  if(CMAKE_ANDROID_ARCH_ABI STREQUAL "riscv64")
+    target_link_options(cpp_host PRIVATE -Wl,--wrap=__riscv_hwprobe,--wrap=fopen,--wrap=mmap
+      -Wl,--wrap=mprotect,--wrap=pidfd_open
+      -Wl,--wrap=pthread_getspecific
+      -Wl,--wrap=pthread_key_create,--wrap=posix_memalign)
+    # Compile the TLSDESC clobber check with -O2 so RVV and FP registers stay live across the call.
+    target_compile_options(linker_lifecycle PRIVATE -O2)
+    # Also test traditional dynamic TLS (-mtls-dialect=trad) alongside default TLSDESC.
+    add_library(linker_lifecycle_trad SHARED lifecycle_module.c)
+    target_compile_options(linker_lifecycle_trad PRIVATE -fno-emulated-tls -mtls-dialect=trad)
+    target_link_options(linker_lifecycle_trad PRIVATE -Wl,-z,max-page-size=16384
+      -Wl,--pack-dyn-relocs=relr)
+    add_dependencies(cpp_host linker_lifecycle_trad)
+  endif()
 endif()
 foreach(host c_host cpp_host)
   if(YUKILINKER_CFI)
@@ -205,7 +243,8 @@ endforeach()
 add_executable(bootstrap_host bootstrap_host.cpp)
 target_link_libraries(bootstrap_host PRIVATE YukiLinker::headers dl)
 target_compile_options(bootstrap_host PRIVATE -UNDEBUG)
-target_link_options(bootstrap_host PRIVATE -Wl,--export-dynamic)
+target_link_options(bootstrap_host PRIVATE -Wl,--export-dynamic
+  -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384)
 if(TARGET YukiLinker::bootstrap AND NOT YUKILINKER_CFI)
   # Extra version records exercise metadata unmap failure on both pointer widths.
   set(core_versions "CORE { global: zygisk_*; local: *; };\n")

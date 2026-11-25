@@ -2,10 +2,12 @@
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
 #pragma once
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/memfd.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +35,19 @@ inline int fixture_fd(const char* directory, const char* name) {
     return -1;
   }
   return fd;
+}
+
+template <typename Check>
+void run_on_worker(Check check, const pthread_attr_t* attributes = nullptr) {
+  pthread_t worker;
+  assert(pthread_create(
+             &worker, attributes,
+             [](void* opaque) -> void* {
+               (*static_cast<Check*>(opaque))();
+               return nullptr;
+             },
+             &check) == 0);
+  assert(pthread_join(worker, nullptr) == 0);
 }
 
 enum class BootCase {

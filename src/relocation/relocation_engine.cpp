@@ -24,6 +24,9 @@ uintptr_t invoke_ifunc(ImageState* image, uintptr_t resolver) {
 #elif defined(__arm__)
   // Bionic's arm32 resolvers take AT_HWCAP.
   return call_module(resolver, getauxval(AT_HWCAP), 0);
+#elif defined(__riscv) && __riscv_xlen == 64
+  // Bionic's riscv64 resolvers take (AT_HWCAP, __riscv_hwprobe, nullptr).
+  return call_module(resolver, getauxval(AT_HWCAP), reinterpret_cast<uintptr_t>(__riscv_hwprobe));
 #else
   // Bionic's i386 and x86-64 resolvers take no arguments.
   return call_module(resolver, 0, 0);
@@ -647,8 +650,8 @@ bool pc_relative(uint32_t type) {
 size_t relocation_width(uint32_t type) {
 #if defined(__x86_64__)
   if (type == R_X86_64_32 || type == R_X86_64_PC32) return sizeof(uint32_t);
-#elif defined(__aarch64__)
-  if (type == R_AARCH64_TLSDESC) return 2 * sizeof(ElfW(Addr));
+#elif defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+  if (type == arch::kTlsDesc) return 2 * sizeof(ElfW(Addr));
 #else
   (void)type;
 #endif
@@ -790,8 +793,8 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
   const bool indirect = type == arch::kIRelative;
   const bool static_tls = type == arch::kTpOff;
   bool tls = type == arch::kDtpMod || type == arch::kDtpOff;
-#if defined(__aarch64__)
-  tls = tls || static_tls || type == R_AARCH64_TLSDESC;
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+  tls = tls || static_tls || type == arch::kTlsDesc;
 #elif YUKILINKER_FULL
   tls = tls || static_tls;
 #endif
@@ -919,18 +922,28 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
                  apply_addend(reinterpret_cast<uintptr_t>(image->memory.bias), addend));
       return true;
 #if YUKILINKER_FULL
-#if defined(__aarch64__)
-    case R_AARCH64_TLSDESC: {
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+    case arch::kTlsDesc: {
       TlsReference reference;
       if (!resolve_tls_reference(image, symbol_index, addend, &reference)) return false;
+      // Both entries live in Core even when the importing image has no PT_TLS of its own.
+      image->binds_core_wrapper = true;
       void* argument = static_cast<uint8_t*>(destination) + sizeof(uintptr_t);
       if (reference.unresolved_weak) {
         store_word(destination, reinterpret_cast<uintptr_t>(&yuki_tlsdesc_weak_entry));
         store_word(argument, reference.byte_offset);
         return true;
       }
+#if defined(__riscv) && __riscv_xlen == 64
+      if (!prepare_riscv_tlsdesc_spills(image)) {
+        name_relocation(relocation.r_offset, type);
+        return false;
+      }
+#endif
       auto* cookie = metadata_object<TlsDescriptorIndex>(&image->memory.metadata);
-      if (cookie == nullptr) return false;
+      if (cookie == nullptr)
+        return fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
+                    relocation.r_offset, type);
       cookie->module = reference.module_id;
       cookie->offset = reference.byte_offset;
       cookie->generation = reference.generation;
@@ -954,7 +967,9 @@ bool apply_relocation(ImageState* image, const ElfRelocation& relocation, Lookup
       if (type == arch::kTpOff && !reference.unresolved_weak)
         return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS, nullptr, nullptr,
                     relocation.r_offset, type);
-      store_word(destination, reference.byte_offset);
+      // DTPREL encodes S + A - DTV bias even when an unresolved weak symbol supplies S = 0.
+      const uintptr_t bias = type == arch::kDtpOff ? arch::kTlsDtvOffset : 0;
+      store_word(destination, reference.byte_offset - bias);
       return true;
     }
 #endif

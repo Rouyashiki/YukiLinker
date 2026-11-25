@@ -1,8 +1,8 @@
 # Build and integrate
 
 Use CMake 3.22 or newer, Ninja and Android NDK `30.0.16248370`. Configure at
-API 26 with `arm64-v8a`, `armeabi-v7a`, `x86` or `x86_64`, using a separate build
-directory for each ABI.
+API 26 with `arm64-v8a`, `armeabi-v7a`, `x86` or `x86_64`, or at API 37 with
+`riscv64`, using a separate build directory for each ABI.
 
 ```sh
 cmake -S . -B out/arm64 -G Ninja \
@@ -13,7 +13,7 @@ cmake --install out/arm64 --prefix "$PWD/out/install"
 ```
 
 Each ABI installs two production libraries under `lib/<abi>/`. The public
-headers are directly under `include/`. All four ABIs can share an installation
+headers are directly under `include/`. All five ABIs can share an installation
 prefix because exported CMake targets use separate ABI directories. The library
 filename suffix gives the pointer width. The ABI directory identifies the instruction set.
 
@@ -62,7 +62,7 @@ attachment or mixed archive/source integration is rejected.
 | --- | --- | --- |
 | `YUKILINKER_BUILD_BOOTSTRAP` | `ON` | Build the shared Core loader |
 | `YUKILINKER_CFI` | `OFF` | Instrument runtime for a system-loaded CFI Core (API 27+) |
-| `YUKILINKER_SANITIZER` | empty | Select NDK address, hwaddress, undefined or thread instrumentation |
+| `YUKILINKER_SANITIZER` | empty | Select NDK address, hwaddress, undefined or thread instrumentation. YukiLinker does not support HWASan on `riscv64`. |
 
 Apply compatible instrumentation to the containing Core and its system-loaded
 modules. Use fresh output and install directories for different configurations.
@@ -83,7 +83,8 @@ Set `YUKILINKER_RUNTIME_FORM=archive|sources` and
 consumer with `bootstrap_host --system <absolute-core.so> <fixtures>` to check
 Core unloading followed by fork and process-exit cleanup.
 
-CI builds all four ABIs at API 26 and 31, installs the SDK and compiles the Native hosts
-and consumers. The downloadable archives target API 26.
+CI builds `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64` at API 26 and 31, and
+`riscv64` at API 37, installs the SDK and compiles the Native hosts and
+consumers. The downloadable archives target API 26 (and API 37 for `riscv64`).
 Local QEMU execution needs a provisioned Bionic runtime. The NDK supplies link
 stubs for compilation, so provision executable Bionic libraries separately.

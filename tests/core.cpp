@@ -64,13 +64,31 @@ char native_error[256]{};
     void*, int (*visit)(dl_phdr_info*, size_t, void*), void* data) {
   return dl_iterate_phdr(visit, data);
 }
-const yukilinker_c_host_services host{sizeof(host),   YUKILINKER_C_HOST_SERVICES_VERSION,
-                                      nullptr,        open_system,
-                                      lookup_system,  close_system,
-                                      address_system, error_system,
-                                      phdr_system,    nullptr,
-                                      nullptr,        nullptr,
-                                      nullptr};
+[[gnu::noinline, clang::disable_tail_calls]] size_t page_size_system(void*) {
+  const char* value = getenv("YUKILINKER_TEST_PAGE_SIZE");
+  if (!value || !*value) return static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  char* end = nullptr;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  return (!end || *end != '\0' || parsed == 0) ? static_cast<size_t>(sysconf(_SC_PAGESIZE))
+                                               : static_cast<size_t>(parsed);
+}
+yukilinker_c_host_services make_host_services() {
+  const char* value = getenv("YUKILINKER_TEST_PAGE_SIZE");
+  return {sizeof(yukilinker_c_host_services),
+          YUKILINKER_C_HOST_SERVICES_VERSION,
+          nullptr,
+          open_system,
+          lookup_system,
+          close_system,
+          address_system,
+          error_system,
+          phdr_system,
+          nullptr,
+          (value && *value) ? page_size_system : nullptr,
+          nullptr,
+          nullptr};
+}
+yukilinker_c_host_services host = make_host_services();
 void exit_callback(void*) { ++control->exit_callbacks; }
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*);
 extern "C" void __cxa_finalize(void*);

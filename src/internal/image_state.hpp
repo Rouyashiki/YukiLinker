@@ -190,6 +190,9 @@ struct ImageState {
   bool binds_core_emutls = false;
   // A trusted image cannot transfer a relocation or a lookup that still calls a Core wrapper.
   bool binds_core_wrapper = false;
+#if defined(__riscv) && __riscv_xlen == 64
+  bool uses_riscv_tlsdesc_spills = false;
+#endif
   // A private IFUNC has not yet supplied the address for at least one accessor relocation.
   bool deferred_emutls_accessor = false;
   // Dependency references keep each relocated native control and its provider live.

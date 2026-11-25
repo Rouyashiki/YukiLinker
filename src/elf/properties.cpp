@@ -13,6 +13,9 @@ constexpr uint32_t kFeatureAnd = GNU_PROPERTY_AARCH64_FEATURE_1_AND;
 constexpr uint32_t kBti = 1;
 constexpr uint32_t kPac = 2;
 #endif
+#elif defined(__riscv) && __riscv_xlen == 64
+// GNU_PROPERTY_RISCV_FEATURE_1_AND (RISC-V ELF psABI; omitted from NDK 30 elf.h).
+constexpr uint32_t kFeatureAnd = 0xc0000000;
 #else
 constexpr uint32_t kFeatureAnd = GNU_PROPERTY_X86_FEATURE_1_AND;
 #endif
@@ -103,6 +106,11 @@ bool inspect_properties(const void* source, size_t file_size, SourceLayout* layo
 #elif defined(__arm__)
         if (features)
           return fail_no_errno(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_PROTECTION, offset);
+#elif defined(__riscv) && __riscv_xlen == 64
+        // RISC-V Zicfilp/Zicfiss and future feature bits have no private runtime contract yet.
+        if (features)
+          return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_PROTECTION,
+                      "GNU_PROPERTY_RISCV_FEATURE_1_AND", nullptr, offset);
 #else
         // IBT and shadow-stack bits describe compatible code. The host selects process CET
         // policy; loading an image must not enable either feature on the current thread.

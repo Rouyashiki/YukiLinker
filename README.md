@@ -2,10 +2,11 @@
 
 An Android ELF loader SDK with a standalone bootstrap and a runtime embedded in
 the consuming Core. It supports C and C++17 callers on Android API 26 and newer
-for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`. SDK version is 1.0.0.
+for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`, and on Android API 37 and
+newer for `riscv64`. SDK version is 1.0.0.
 The C ABI and HostServices version are 1.
 
-| Target | ARM64 / x86_64 artifact | ARM32 / x86 artifact | Purpose |
+| Target | 64-bit (`arm64-v8a`, `x86_64`, `riscv64`) | 32-bit (`armeabi-v7a`, `x86`) | Purpose |
 | --- | --- | --- | --- |
 | `YukiLinker::bootstrap` | `libyloader64.so` | `libyloader32.so` | Load Core, transfer ownership and unload bootstrap |
 | `YukiLinker::runtime` | `libylrt64.a` | `libylrt32.a` | Complete PIC runtime linked into Core |
@@ -20,7 +21,8 @@ add_library(core SHARED core.cpp)
 target_link_libraries(core PRIVATE YukiLinker::runtime)
 ```
 
-Use NDK `30.0.16248370` and target API 26 to build the SDK for Android 8.0.
+Use NDK `30.0.16248370` and target API 26 to build the SDK for Android 8.0
+(`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`), or API 37 for `riscv64`.
 Hosts can select a higher minimum, as YukiZygisk does with API 31.
 PRIVATE loads independently managed ELF images.
 SYSTEM uses Bionic's component and runtime integration. Close outcomes describe

@@ -23,6 +23,43 @@ namespace {
 // SELinux execmem or execmod), ENOMEM a mapping limit; neither says the image is unsupported.
 bool fail_protection() { return fail_errno(YUKILINKER_C_PROTECTION, errno); }
 
+#if defined(__riscv) && __riscv_xlen == 64
+// Sysfs lists possible CPU IDs as comma-separated numbers and inclusive ranges.
+bool covers_possible_cpus(FILE* possible, const cpu_set_t& supported) {
+  int separator;
+  do {
+    unsigned first;
+    if (fscanf(possible, "%u", &first) != 1) return false;
+    unsigned last = first;
+    separator = fgetc(possible);
+    if (separator == '-') {
+      if (fscanf(possible, "%u", &last) != 1) return false;
+      separator = fgetc(possible);
+    }
+    if (first > last || last >= CPU_SETSIZE) return false;
+    for (unsigned cpu = first; cpu <= last; ++cpu) {
+      if (!CPU_ISSET(cpu, &supported)) return false;
+    }
+  } while (separator == ',');
+  return separator == '\n';
+}
+
+bool all_possible_cpus_have_ztso() {
+  // An empty WHICH_CPUS query returns only online CPUs with Ztso. Every CPU that could
+  // later run a module thread must appear in that same result, including hotplug candidates.
+  riscv_hwprobe feature{RISCV_HWPROBE_KEY_IMA_EXT_0, RISCV_HWPROBE_EXT_ZTSO};
+  cpu_set_t supported{};
+  if (__riscv_hwprobe(&feature, 1, sizeof(supported), &supported, RISCV_HWPROBE_WHICH_CPUS) != 0 ||
+      feature.key != RISCV_HWPROBE_KEY_IMA_EXT_0)
+    return false;
+  FILE* possible = fopen("/sys/devices/system/cpu/possible", "re");
+  if (!possible) return false;
+  const bool covered = covers_possible_cpus(possible, supported);
+  fclose(possible);
+  return covered;
+}
+#endif
+
 }  // namespace
 
 uint64_t program_header_file_offset(const AddressSpace& memory, size_t index) {
@@ -63,6 +100,19 @@ bool inspect_source(const void* source, size_t file_size, SourceLayout* layout) 
     }
     return false;
   }
+#if defined(__riscv) && __riscv_xlen == 64
+  // The RISC-V psABI assigns these pointer ABI flags; NDK 30's elf.h omits them.
+  constexpr uint32_t kRv64Ilp32 = 0x20, kRvy = 0x40;
+  constexpr uint32_t kAbiMask = EF_RISCV_RVE | EF_RISCV_FLOAT_ABI_MASK | kRv64Ilp32 | kRvy;
+  if ((parsed.header->e_flags & kAbiMask) != EF_RISCV_FLOAT_ABI_DOUBLE) {
+    host_log_error("yukilinker: Android riscv64 requires the LP64D calling convention");
+    return fail_no_errno(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA);
+  }
+  if ((parsed.header->e_flags & EF_RISCV_TSO) && !all_possible_cpus_have_ztso()) {
+    host_log_error("yukilinker: EF_RISCV_TSO requires Ztso on all possible CPUs");
+    return fail_no_errno(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_METADATA);
+  }
+#endif
   *layout = {parsed.header,
              parsed.headers,
              parsed.count,

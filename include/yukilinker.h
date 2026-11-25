@@ -855,8 +855,8 @@ YUKILINKER_C_API uint32_t yukilinker_c_forget(yukilinker_c_runtime* runtime,
 /* Error code: OK transfers a Ready trusted image mapping to the caller and invalidates
  * the handle, leaving the mapping intact. Refuses while used/pinned/referenced elsewhere.
  * Delete PRIVATE pthread keys with destructors in this image before handoff. An image that
- * binds Core pthread key wrappers, uses Core emutls storage or imports ordinary PRIVATE
- * emutls controls remains owned by Core and must be closed normally.
+ * binds Core pthread key wrappers or TLSDESC entries, uses Core emutls storage or imports
+ * ordinary PRIVATE emutls controls remains owned by Core and must be closed normally.
  * Dependencies are closed by this operation; bootstrap uses its separate dependency-transfer
  * protocol. The receiving host must ultimately retire the mapping and all its callbacks. */
 YUKILINKER_C_API uint32_t yukilinker_c_release_host(yukilinker_c_runtime* runtime,

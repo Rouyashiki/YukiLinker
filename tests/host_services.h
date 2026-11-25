@@ -7,10 +7,31 @@
 #include <android/dlext.h>
 #include <link.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <yukilinker.h>
 
 static __thread char test_saved_error[512];
 static __thread int test_pending_error;
+
+static inline size_t test_requested_page_size(void) {
+  const char* value = getenv("YUKILINKER_TEST_PAGE_SIZE");
+  if (!value || !*value) return 0;
+  char* end = NULL;
+  unsigned long parsed = strtoul(value, &end, 10);
+  if (!end || *end != '\0' || parsed == 0) return 0;
+  return (size_t)parsed;
+}
+
+static inline size_t test_page_size_hook(void* user) {
+  (void)user;
+  return test_requested_page_size();
+}
+
+static inline size_t test_loader_page_size(void) {
+  const size_t requested = test_requested_page_size();
+  return requested ? requested : (size_t)sysconf(_SC_PAGESIZE);
+}
 
 /* Bionic selects a namespace from the caller's return address. */
 #define TEST_HOST_CALL __attribute__((noinline, disable_tail_calls))
@@ -53,7 +74,7 @@ static TEST_HOST_CALL int test_iterate(void* user,
   (void)user;
   return dl_iterate_phdr(visit, data);
 }
-static yukilinker_c_host_services test_host_services(void) {
+static inline yukilinker_c_host_services test_host_services(void) {
   yukilinker_c_host_services services = {0};
   services.size = sizeof(services);
   services.version = YUKILINKER_C_HOST_SERVICES_VERSION;
@@ -63,6 +84,7 @@ static yukilinker_c_host_services test_host_services(void) {
   services.system_dladdr = test_address;
   services.system_dlerror = test_error;
   services.system_iterate_phdr = test_iterate;
+  if (test_requested_page_size() != 0) services.page_size = test_page_size_hook;
   return services;
 }
 #undef TEST_HOST_CALL

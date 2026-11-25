@@ -6,7 +6,19 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(KEY_PROVIDER)
+#if defined(TLSDESC_IMPORTER)
+// All TLS comes from an optional global provider. This image has no PT_TLS or DT_NEEDED.
+extern __thread int fixture_tls_value __attribute__((weak));
+int* imported_tls_address(void) { return &fixture_tls_value; }
+#elif defined(TLSDESC_PROVIDER)
+__thread int fixture_tls_value = 42;
+int* provided_tls_address(void) { return &fixture_tls_value; }
+#elif defined(EMUTLS_RUNTIME)
+__attribute__((visibility("default"))) __thread int emutls_runtime_anchor = 1;
+__attribute__((visibility("default"))) int* emutls_runtime_slot(void) {
+  return &emutls_runtime_anchor;
+}
+#elif defined(KEY_PROVIDER)
 static int delete_key(pthread_key_t key) { return (int)key; }
 extern __typeof__(delete_key) pthread_key_delete __attribute__((alias("delete_key")));
 int (*fixture_key_provider(void))(pthread_key_t) { return delete_key; }

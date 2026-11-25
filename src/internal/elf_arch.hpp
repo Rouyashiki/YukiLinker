@@ -50,8 +50,32 @@ inline constexpr uint32_t kIRelative = R_X86_64_IRELATIVE;
 inline constexpr uint32_t kDtpMod = R_X86_64_DTPMOD64;
 inline constexpr uint32_t kDtpOff = R_X86_64_DTPOFF64;
 inline constexpr uint32_t kTpOff = R_X86_64_TPOFF64;
+#elif defined(__riscv) && __riscv_xlen == 64
+inline constexpr uint16_t kMachine = EM_RISCV;
+inline constexpr uint32_t kAbsolute = R_RISCV_64;
+// RISC-V uses R_RISCV_64 for GOT entries and defines no separate GLOB_DAT code.
+inline constexpr uint32_t kGlobDat = R_RISCV_64;
+inline constexpr uint32_t kJumpSlot = R_RISCV_JUMP_SLOT;
+inline constexpr uint32_t kRelative = R_RISCV_RELATIVE;
+inline constexpr uint32_t kIRelative = R_RISCV_IRELATIVE;
+inline constexpr uint32_t kDtpMod = R_RISCV_TLS_DTPMOD64;
+inline constexpr uint32_t kDtpOff = R_RISCV_TLS_DTPREL64;
+inline constexpr uint32_t kTpOff = R_RISCV_TLS_TPREL64;
 #else
 #error Unsupported Android ELF machine
+#endif
+
+#if defined(__aarch64__)
+inline constexpr uint32_t kTlsDesc = R_AARCH64_TLSDESC;
+#elif defined(__riscv) && __riscv_xlen == 64
+inline constexpr uint32_t kTlsDesc = R_RISCV_TLSDESC;
+#endif
+
+#if defined(__riscv) && __riscv_xlen == 64
+// RISC-V ELF psABI and Bionic bias DTPREL64 by -0x800 and add 0x800 in __tls_get_addr.
+inline constexpr uintptr_t kTlsDtvOffset = 0x800;
+#else
+inline constexpr uintptr_t kTlsDtvOffset = 0;
 #endif
 
 #if defined(__i386__)

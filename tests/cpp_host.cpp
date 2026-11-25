@@ -29,8 +29,9 @@
 #include "host_services.h"
 #include "relro_fixture.hpp"
 
-#if (defined(__i386__) || defined(__x86_64__)) && !defined(YUKILINKER_TEST_CFI)
-#include "x86_relocations.hpp"
+#if !defined(YUKILINKER_TEST_CFI) && \
+    (defined(__i386__) || defined(__x86_64__) || (defined(__riscv) && __riscv_xlen == 64))
+#include "relocations.hpp"
 #endif
 
 #if defined(YUKILINKER_TEST_X86_CALLS)
@@ -330,8 +331,13 @@ void check_deleted_key_shutdown(yukilinker::Runtime& runtime, const char* direct
              &release) == 0);
   assert(pthread_join(worker, nullptr) == 0 && calls == 0);
   auto scope = runtime.namespace_create();
-  assert(scope && scope.link(nullptr, YUKILINKER_C_NAMESPACE_LINK_SYSTEM,
-                             "libc.so:libdl.so:libm.so:libc++_shared.so") == yukilinker::Code::Ok);
+#if defined(__riscv) && __riscv_xlen == 64
+  constexpr const char* kSystemSharedLibs = "libc.so:libdl.so:libm.so:libemutls_runtime.so";
+#else
+  constexpr const char* kSystemSharedLibs = "libc.so:libdl.so:libm.so:libc++_shared.so";
+#endif
+  assert(scope && scope.link(nullptr, YUKILINKER_C_NAMESPACE_LINK_SYSTEM, kSystemSharedLibs) ==
+                      yukilinker::Code::Ok);
   for (bool scoped : {true, false}) {
     yukilinker::OpenOptions global;
     global.native.flags |= RTLD_GLOBAL;
@@ -479,19 +485,6 @@ pid_t controlled_fork(yukilinker::Runtime& runtime) {
   return child;
 }
 
-template <typename Check>
-void run_on_worker(Check check) {
-  pthread_t worker;
-  assert(pthread_create(
-             &worker, nullptr,
-             [](void* opaque) -> void* {
-               (*static_cast<Check*>(opaque))();
-               return nullptr;
-             },
-             &check) == 0);
-  assert(pthread_join(worker, nullptr) == 0);
-}
-
 volatile sig_atomic_t key_updates_left, updating_key, signal_in_update, key_signals;
 
 void check_key_frame_signals(yukilinker::Runtime& runtime, const char* directory) {
@@ -546,6 +539,9 @@ void* child_unmap_page;
 size_t child_unmap_size;
 
 void prepare_thread_local() {
+#if defined(__riscv) && __riscv_xlen == 64
+  prepare_nested_spill();
+#endif
   if (prepare_key_gate) meet(*prepare_key_gate);
   if (initialize_in_prepare) assert(initialize_in_prepare(prepare_counts) == 1);
 }
@@ -999,10 +995,14 @@ void check_versioned_emutls(yukilinker::Runtime& runtime, const char* directory)
   // A pre-Q host executable can itself preempt the fixture's weak default definition.
   // Have the local alias forward to that same native implementation in either host.
   using Accessor = void* (*)(void*);
-  void* cxx = dlopen("libc++_shared.so", RTLD_NOW);
-  assert(cxx);
+#if defined(__riscv) && __riscv_xlen == 64
+  void* provider = dlopen("libemutls_runtime.so", RTLD_NOW);
+#else
+  void* provider = dlopen("libc++_shared.so", RTLD_NOW);
+#endif
+  assert(provider);
   auto native = reinterpret_cast<Accessor>(dlsym(RTLD_DEFAULT, "__emutls_get_address"));
-  if (!native) native = reinterpret_cast<Accessor>(dlsym(cxx, "__emutls_get_address"));
+  if (!native) native = reinterpret_cast<Accessor>(dlsym(provider, "__emutls_get_address"));
   assert(native);
   for (auto backend : {yukilinker::Backend::System, yukilinker::Backend::Private}) {
     yukilinker::OpenOptions options{backend};
@@ -1017,7 +1017,7 @@ void check_versioned_emutls(yukilinker::Runtime& runtime, const char* directory)
       assert(!aliases.value.close().handle_valid());
     }
   }
-  assert(dlclose(cxx) == 0);
+  assert(dlclose(provider) == 0);
   auto module = open_fixture(runtime, directory, "versioned");
   assert(module);
   const auto accessor = module.value.symbol<void*>("__emutls_get_address", "TEST_EMUTLS_OLD");
@@ -1542,7 +1542,7 @@ void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* directory,
   assert(data != MAP_FAILED && close(source) == 0);
   const auto* header = static_cast<const ElfW(Ehdr)*>(data);
   auto* segments = reinterpret_cast<ElfW(Phdr)*>(static_cast<char*>(data) + header->e_phoff);
-  const size_t page = sysconf(_SC_PAGESIZE);
+  const size_t page = test_loader_page_size();
   const auto page_end = [page](uintptr_t address) { return (address + page - 1) & ~(page - 1); };
   const ElfW(Phdr)* relro = nullptr;
   for (size_t i = 0; i < header->e_phnum; ++i)
@@ -1599,6 +1599,53 @@ void exercise_relro_mapping(yukilinker::Runtime& runtime, const char* directory,
   assert(close(fd) == 0 && munmap(data, bytes) == 0);
   puts("PASS padded RELRO loading, constructors, page protection and unload");
 }
+
+size_t page_size_4k(void*) { return 4096; }
+size_t page_size_32k(void*) { return 32768; }
+size_t page_size_bad_pow2(void*) { return 12288; }
+
+void exercise_16k_page_mode(yukilinker::Runtime& runtime,
+                            const yukilinker_c_host_services& services, const char* directory,
+                            const char* path) {
+  for (auto bad_hook : {page_size_4k, page_size_32k, page_size_bad_pow2}) {
+    yukilinker_c_host_services invalid = services;
+    invalid.page_size = bad_hook;
+    assert(yukilinker_c_host_services_bind(runtime.native_handle(), &invalid) ==
+           YUKILINKER_C_UNSUPPORTED);
+  }
+  assert(yukilinker_c_host_services_bind(runtime.native_handle(), &services) == YUKILINKER_C_OK);
+
+  auto loaded = runtime.open_path(path);
+  assert(loaded);
+  const auto image = loaded.value.image();
+  assert(image && (image.value.load_bias % 16384) == 0);
+  assert(loaded.value.symbol<int (*)()>("module_answer").value() == 42);
+  assert(loaded.value.close().private_mapping_unmapped());
+
+  const int source = open(path, O_RDONLY | O_CLOEXEC);
+  struct stat status{};
+  assert(source >= 0 && fstat(source, &status) == 0 && status.st_size > 0);
+  const size_t bytes = static_cast<size_t>(status.st_size);
+  void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE, source, 0);
+  assert(data != MAP_FAILED && close(source) == 0);
+  const auto* header = static_cast<const ElfW(Ehdr)*>(data);
+  auto* segments = reinterpret_cast<ElfW(Phdr)*>(static_cast<char*>(data) + header->e_phoff);
+  bool modified = false;
+  for (size_t i = 0; i < header->e_phnum; ++i) {
+    if (segments[i].p_type == PT_LOAD && segments[i].p_align > 4096) {
+      segments[i].p_align = 4096;
+      modified = true;
+    }
+  }
+  assert(modified);
+  const int fd = fixture_fd(directory, "align-4k");
+  assert(fd >= 0 && write(fd, data, bytes) == static_cast<ssize_t>(bytes));
+  const auto rejected = runtime.open_fd(fd);
+  assert(!rejected && rejected.error.code() == yukilinker::Code::Unsupported &&
+         rejected.error.native.detail.stage == YUKILINKER_C_METADATA);
+  assert(close(fd) == 0 && munmap(data, bytes) == 0);
+  puts("PASS 16 KiB host page_size validation, alignment and 4 KiB ELF rejection");
+}
 #endif
 
 namespace {
@@ -1642,6 +1689,51 @@ int close_dependency(void* user, void* dependency) {
 }
 
 #if !defined(YUKILINKER_TEST_CFI)
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+void check_tlsdesc_handoff(yukilinker::Runtime& runtime, const char* directory) {
+  // The ELF-global provider stays mapped after close. Isolate its relocation scope.
+  const pid_t child = fork();
+  assert(child >= 0);
+  if (child) {
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    puts("PASS trusted TLSDESC handoff refused for unresolved and resolved external TLS");
+    return;
+  }
+  char path[4096];
+  snprintf(path, sizeof(path), "%s/libtlsdesc_importer.so", directory);
+  yukilinker::OpenOptions trusted;
+  trusted.native.trusted_runtime = 1;
+  const auto check_importer = [&](Slot provider_slot) {
+    auto importer = runtime.open_path(path, trusted);
+    assert(importer && importer.value.release_host() == yukilinker::Code::Busy);
+    auto address = importer.value.symbol<Slot>("imported_tls_address");
+    assert(address);
+    run_on_worker([&] {
+      int* value = address.value();
+      if (provider_slot) {
+        assert(value && value == provider_slot() && *value == 42);
+      } else {
+        assert(!value);
+      }
+    });
+    assert(importer.value.close().private_mapping_unmapped());
+  };
+  check_importer(nullptr);
+  char provider_path[4096];
+  snprintf(provider_path, sizeof(provider_path), "%s/libtlsdesc_provider.so", directory);
+  auto provider = runtime.open_path(provider_path);
+  assert(provider);
+  auto slot = provider.value.symbol<Slot>("provided_tls_address");
+  assert(slot);
+  check_importer(slot.value);
+  const auto closed = provider.value.close();
+  assert(closed.handle_valid() && closed.reference() == yukilinker::Reference::Released &&
+         provider.value.forget() == yukilinker::Code::Ok);
+  _exit(0);
+}
+#endif
+
 void check_trusted_key_writer(yukilinker::Runtime& runtime, const char* directory) {
   auto owner = open_fixture(runtime, directory, "weak");
   yukilinker::OpenOptions trusted;
@@ -1719,6 +1811,18 @@ void check_key_retirement(yukilinker::Runtime& runtime, const char* directory, b
 extern "C" int __real_pthread_setspecific(pthread_key_t, const void*);
 extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void* value) {
 #if !defined(YUKILINKER_TEST_CFI)
+#if defined(__riscv) && __riscv_xlen == 64
+  if (redirect_spill_probe && key == last_created_spill_key && value)
+    return __real_pthread_setspecific(key, &redirect_spill_probe);
+  if (exit_spill_wait && key == yukilinker::internal::g_operation_depth_key &&
+      (reinterpret_cast<uintptr_t>(value) >> yukilinker::internal::kLockWaitShift)) {
+    const int status = __real_pthread_setspecific(key, value);
+    assert(status == 0);
+    exit_spill_wait = false;
+    __atomic_store_n(&spill_wait_registered, true, __ATOMIC_RELEASE);
+    return status;
+  }
+#endif
   if (key_updates_left && key == yukilinker::internal::g_callback_key &&
       (key_updates_left == 2) == (value != nullptr)) {
     // Interrupt just before publishing the frame or just after removing it.
@@ -1780,6 +1884,12 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
   return 0;
 #else
   check_signal_mask();
+#if defined(__riscv) && __riscv_xlen == 64
+  exercise_riscv_spill_errors(runtime, directory, fail_mapping);
+#endif
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+  check_tlsdesc_handoff(runtime, directory);
+#endif
   exercise_load_wait(runtime, path);
   const pid_t waiting_child = controlled_fork(runtime);
   if (!waiting_child) {
@@ -1791,10 +1901,14 @@ extern "C" __attribute__((visibility("default"))) int yukilinker_test_run(const 
 #if defined(YUKILINKER_TEST_X86_CALLS)
   exercise_x86_calls(runtime, directory);
 #endif
-#if defined(__i386__) || defined(__x86_64__)
-  exercise_x86_relocations(runtime, directory);
+#if defined(__i386__) || defined(__x86_64__) || (defined(__riscv) && __riscv_xlen == 64)
+  exercise_arch_relocations(runtime, directory);
+#endif
+#if defined(__riscv) && __riscv_xlen == 64
+  check_riscv_spill_stats(runtime, fail_mapping);
 #endif
   exercise_relro_mapping(runtime, directory, path);
+  if (test_loader_page_size() == 16384) exercise_16k_page_mode(runtime, services, directory, path);
   auto context_source = runtime.context(directory);
   assert(context_source);
   auto context = std::move(context_source);

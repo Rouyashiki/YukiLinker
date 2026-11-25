@@ -29,6 +29,12 @@ target_compile_definitions(core PRIVATE YUKILINKER_TEST_SHARED=1)
 target_compile_options(core PRIVATE -UNDEBUG)
 if(YUKILINKER_CONSUMER_LANGUAGE STREQUAL "CXX")
   target_link_options(core PRIVATE -Wl,--wrap=munmap,--wrap=pthread_setspecific)
+  if(CMAKE_ANDROID_ARCH_ABI STREQUAL "riscv64" AND NOT YUKILINKER_CONSUMER_CFI)
+    target_link_options(core PRIVATE -Wl,--wrap=__riscv_hwprobe,--wrap=fopen,--wrap=mmap
+      -Wl,--wrap=mprotect,--wrap=pidfd_open
+      -Wl,--wrap=pthread_getspecific
+      -Wl,--wrap=pthread_key_create,--wrap=posix_memalign)
+  endif()
   if(YUKILINKER_CONSUMER_NOEXCEPT)
     target_compile_options(core PRIVATE -fno-exceptions -fno-rtti)
     target_compile_definitions(core PRIVATE YUKILINKER_TEST_NOEXCEPT=1)

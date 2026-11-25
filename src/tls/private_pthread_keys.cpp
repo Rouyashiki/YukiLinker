@@ -501,7 +501,7 @@ bool has_private_key_destructor(const ImageState* image) {
 // A destructor can first set a private key after dispatch's turn in Bionic's final pass. There
 // is then no further callback. A collection can discard its pins once the kernel confirms that
 // the thread is gone. A reused TID or a denied probe only delays collection. Never inspect a
-// dead pthread_t. No per-thread fd or procfs access is needed.
+// dead pthread_t. Confirming an exit needs neither a per-thread fd nor a procfs entry.
 void reap_exited_threads() {
   if (!threads && !g_thread_states) return;
   ScopedSignalBlocker signals;

@@ -87,6 +87,17 @@ struct TlsDescriptorIndex {
   uintptr_t offset;
   uintptr_t generation;
 };
+#if defined(__riscv) && __riscv_xlen == 64
+bool prepare_riscv_tlsdesc_spills(ImageState* image);
+void commit_riscv_tlsdesc_spills(uint64_t first_generation);
+bool rollback_riscv_tlsdesc_spills();
+size_t riscv_tlsdesc_mapped_bytes();
+void reap_riscv_tlsdesc_spills();
+void prepare_riscv_tlsdesc_spills_for_fork();
+void unlock_riscv_tlsdesc_spills_after_fork(bool child, pid_t parent_tid);
+bool riscv_tlsdesc_spills_busy();
+bool release_riscv_tlsdesc_spills();
+#endif
 // Only its own thread writes generation, storage and memory_bytes, with signals blocked; the
 // lock-free path reads them with __atomic builtins, generation first. Other threads write only
 // owner (detach), which that path never reads.
@@ -111,6 +122,10 @@ struct ThreadExitRecord;
 struct ThreadTlsState {
   pid_t tid = 0;
   uintptr_t identity = 0;
+#if defined(__riscv) && __riscv_xlen == 64
+  uintptr_t thread_pointer = 0;
+  uintptr_t* spill_tag = nullptr;
+#endif
   ThreadBlockTable* blocks = nullptr;
   ThreadTlsBlock* first = nullptr;
   EmutlsTable* emutls = nullptr;
@@ -213,6 +228,10 @@ ThreadTlsState* thread_tls_state(bool* created = nullptr);
 // own call created, or shutdown's own.
 void release_empty_thread_tls_state(ThreadTlsState* state);
 void* current_thread_tls_data(uintptr_t module_id, uintptr_t generation);
+// Symbol lookup supplies ENOMEM for ordinary allocation failures. A failed spill mapping
+// replaces it with its own errno before thread-state rollback can overwrite it.
+void* tls_block_address(uintptr_t module_id, uintptr_t byte_offset,
+                        int* allocation_error = nullptr);
 extern "C" void* yuki_tls_get_addr(TlsIndex* index);
 #if defined(__i386__)
 // The i386 general-dynamic PLT call passes its TLS index in EAX.
@@ -220,7 +239,7 @@ extern "C" __attribute__((regparm(1))) void* yuki_tls_get_addr_i386(TlsIndex* in
 #endif
 bool discover_tls_segment(ImageState* image);
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
 extern "C" uintptr_t yuki_tlsdesc_dynamic_entry(uintptr_t* descriptor);
 extern "C" uintptr_t yuki_tlsdesc_weak_entry(uintptr_t* descriptor);
 #endif

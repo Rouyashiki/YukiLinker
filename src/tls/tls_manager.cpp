@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include "../internal/elf_arch.hpp"
 #include "../internal/enumeration.hpp"
 #if YUKILINKER_FULL
 #include "../internal/private_pthread_keys.hpp"
 #endif
 #include "../internal/runtime_model.hpp"
+#if YUKILINKER_FULL && defined(__riscv) && __riscv_xlen == 64
+#include <linux/futex.h>
+#include <linux/pidfd.h>
+#include <poll.h>
+#include <sys/pidfd.h>
+
+#include <iterator>
+
+#include "../arch/riscv64/tlsdesc_layout.h"
+#endif
 
 namespace yukilinker::internal {
 
@@ -14,6 +25,15 @@ namespace yukilinker::internal {
 // so registering a destructor never needs a symbol lookup from an atfork handler.
 extern "C" int __cxa_thread_atexit_impl(void (*)(void*), void*, void*);
 namespace {
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+uintptr_t current_thread_pointer() {
+  return reinterpret_cast<uintptr_t>(__builtin_thread_pointer());
+}
+#endif
+
+#if defined(__riscv) && __riscv_xlen == 64
+bool reserve_thread_spill(ThreadTlsState* thread, size_t file_bytes = 0);
+#endif
 
 // Under the mask, or by the owning thread's lock-free path.
 ThreadTlsBlock* table_block(ThreadBlockTable* table, uintptr_t module_id) {
@@ -106,7 +126,19 @@ void release_registered_destructor(ThreadExitRecord* record) {
   free_object(record);
 }
 
+#if defined(__riscv) && __riscv_xlen == 64
+void release_thread_spill_tag(ThreadTlsState* state) {
+  if (state->spill_tag) {
+    __atomic_store_n(state->spill_tag, uintptr_t{0}, __ATOMIC_RELEASE);
+    state->spill_tag = nullptr;
+  }
+}
+#endif
+
 bool release_native_thread_storage(ThreadTlsState* state) {
+#if defined(__riscv) && __riscv_xlen == 64
+  release_thread_spill_tag(state);
+#endif
   bool unpinned = false;
   ThreadTlsBlock* block = state->first;
   while (block != nullptr) {
@@ -265,6 +297,9 @@ ThreadTlsState* thread_tls_state(bool* created) {
   if (state == nullptr) return nullptr;
   state->tid = gettid();
   state->identity = identity;
+#if defined(__riscv) && __riscv_xlen == 64
+  state->thread_pointer = current_thread_pointer();
+#endif
   if (pthread_setspecific(g_thread_tls_key, state) != 0) {
     free_object(state);
     return nullptr;
@@ -460,7 +495,14 @@ namespace {
 
 // Under g_tls_mutex with signals blocked: this thread's block for the template, made or replaced
 // as needed. Only this thread writes its table and blocks.
-void* thread_block_address(ThreadTlsState* thread, const TlsTemplate& tls, uintptr_t offset) {
+void* thread_block_address(ThreadTlsState* thread, const TlsTemplate& tls, uintptr_t offset,
+                           [[maybe_unused]] int* allocation_error) {
+#if defined(__riscv) && __riscv_xlen == 64
+  if (!thread->spill_tag && !reserve_thread_spill(thread)) {
+    if (allocation_error) *allocation_error = errno;
+    return nullptr;
+  }
+#endif
   ThreadTlsBlock* block = find_thread_block(thread, tls.module_id);
   if (block == nullptr) {
     if (!ensure_thread_block_capacity(thread, tls.module_id)) return nullptr;
@@ -478,7 +520,7 @@ void* thread_block_address(ThreadTlsState* thread, const TlsTemplate& tls, uintp
 // Bionic's tls_get_addr_slow_path, except that the operation lock is waited for with the
 // caller's signal mask (a load may hold it for long). Everything after it runs with signals
 // blocked, and g_tls_mutex is then never contended: every holder also holds the operation lock.
-__attribute__((noinline)) void* tls_get_addr_slow(const TlsIndex& index) {
+__attribute__((noinline)) void* tls_get_addr_slow(const TlsIndex& index, int* allocation_error) {
   OperationGuard operation;
   // activate_tls creates the key before any template, so without it nothing is active. This
   // path therefore never takes g_key_mutex, which explicit prepare_fork holds.
@@ -492,7 +534,8 @@ __attribute__((noinline)) void* tls_get_addr_slow(const TlsIndex& index) {
   TlsTemplate* tls = find_tls_template(index.module);
   if (tls != nullptr && index.offset < tls->memory_bytes) {
     thread = thread_tls_state(&created);
-    if (thread != nullptr) address = thread_block_address(thread, *tls, index.offset);
+    if (thread != nullptr)
+      address = thread_block_address(thread, *tls, index.offset, allocation_error);
   }
   pthread_mutex_unlock(&g_tls_mutex);
   // A failed allocation keeps no state this call made: an empty one would hold shutdown off.
@@ -502,12 +545,20 @@ __attribute__((noinline)) void* tls_get_addr_slow(const TlsIndex& index) {
 
 }  // namespace
 
-extern "C" void* yuki_tls_get_addr(TlsIndex* index) {
+void* tls_block_address(uintptr_t module_id, uintptr_t byte_offset, int* allocation_error) {
   // Module 0 (an unresolved weak TLS symbol) has no block: null, with no side effect.
-  if (index == nullptr || index->module == 0) return nullptr;
+  if (module_id == 0) return nullptr;
   // Lock-free for a block this thread already has, as Bionic's TLS_GET_ADDR.
-  void* address = own_block_address(index->module, index->offset, nullptr);
-  return address != nullptr ? address : tls_get_addr_slow(*index);
+  void* address = own_block_address(module_id, byte_offset, nullptr);
+  if (address != nullptr) return address;
+  const TlsIndex index{static_cast<unsigned long>(module_id),
+                       static_cast<unsigned long>(byte_offset)};
+  return tls_get_addr_slow(index, allocation_error);
+}
+
+extern "C" void* yuki_tls_get_addr(TlsIndex* index) {
+  if (index == nullptr || index->module == 0) return nullptr;
+  return tls_block_address(index->module, index->offset + arch::kTlsDtvOffset);
 }
 
 namespace {
@@ -766,23 +817,645 @@ void* current_thread_tls_data(uintptr_t module_id, uintptr_t generation) {
   return matched == generation ? storage : nullptr;
 }
 
-uintptr_t current_thread_pointer() {
-  return reinterpret_cast<uintptr_t>(__builtin_thread_pointer());
-}
-
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
 extern "C" __attribute__((visibility("hidden"))) uintptr_t
 yuki_tlsdesc_dynamic_body(uintptr_t* descriptor) {
-  auto* index = reinterpret_cast<TlsIndex*>(descriptor[1]);
-  void* address = yuki_tls_get_addr(index);
+  uintptr_t raw = 0;
+  memcpy(&raw, reinterpret_cast<const uint8_t*>(descriptor) + sizeof(raw), sizeof(raw));
+  const auto* cookie = reinterpret_cast<const TlsDescriptorIndex*>(raw);
+  void* address = tls_block_address(cookie->module, cookie->offset);
   return reinterpret_cast<uintptr_t>(address) - current_thread_pointer();
 }
-#endif  // #if defined(__aarch64__)
+#endif  // #if defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64)
+#if defined(__riscv) && __riscv_xlen == 64
+// The resolver links banks in a single Core-owned mapping, preserving the scan order so
+// later bursts reuse the same files. Only the first header stores the register file size.
+struct RiscvSpillBank {
+  RiscvSpillBank* next;
+  size_t file_bytes;
+  uintptr_t owners[YUKI_RVV_TOTAL_SLOTS];
+  uintptr_t frames[YUKI_RVV_TOTAL_SLOTS];
+};
+struct RiscvThreadSpills {
+  RiscvThreadSpills* next;
+  size_t file_bytes;
+  uintptr_t owners[YUKI_RVV_NESTED_SLOTS];
+  uintptr_t thread;
+  uintptr_t frames[YUKI_RVV_NESTED_SLOTS];
+};
+static_assert(offsetof(RiscvSpillBank, file_bytes) == 8 &&
+              offsetof(RiscvSpillBank, owners) == YUKI_RVV_OWNERS &&
+              offsetof(RiscvSpillBank, frames) == YUKI_RVV_FRAMES &&
+              sizeof(RiscvSpillBank) == YUKI_RVV_FILES);
+static_assert(offsetof(RiscvThreadSpills, file_bytes) == 8 &&
+              offsetof(RiscvThreadSpills, owners) == YUKI_RVV_OWNERS &&
+              offsetof(RiscvThreadSpills, thread) == YUKI_RVV_THREAD_TAG &&
+              offsetof(RiscvThreadSpills, frames) == YUKI_RVV_THREAD_FRAMES &&
+              sizeof(RiscvThreadSpills) == YUKI_RVV_THREAD_FILES);
+constexpr size_t kTidsPerPinChunk = size_t{1} << YUKI_RVV_PIN_CHUNK_SHIFT;
+constexpr size_t kPinChunkWords = kTidsPerPinChunk / YUKI_RVV_PIN_GROUP;
+constexpr size_t kSpillPinWords = (1u << YUKI_RISCV_TID_BITS) / YUKI_RVV_PIN_GROUP;
+constexpr size_t kPinDirectoryWords = kSpillPinWords / kPinChunkWords / 64;
+extern "C" {
+__attribute__((visibility("hidden"))) RiscvSpillBank* yuki_riscv_spill_banks = nullptr;
+__attribute__((visibility("hidden"))) RiscvThreadSpills* yuki_riscv_thread_spills = nullptr;
+__attribute__((visibility("hidden"))) size_t yuki_riscv_spill_stride = 0;
+__attribute__((visibility("hidden"))) uintptr_t yuki_riscv_spill_end = 0;
+__attribute__((visibility("hidden"))) uintptr_t yuki_riscv_spill_fork_thread = 0;
+// Bionic LP64 non-PI recursive mutexes keep the owner TID in the second 32-bit
+// word. Validate it before publishing any descriptor that can read it.
+extern __attribute__((visibility("hidden"))) const int32_t* const yuki_riscv_operation_owner_tid =
+    &g_operation_mutex.__private[1];
+// Offset and sequence of our own Bionic pthread key. Neither word changes
+// while a descriptor can execute. One bit per possible Linux TID pins its
+// destructor before the first borrow, including an interrupted first visit.
+__attribute__((visibility("hidden"))) uintptr_t yuki_riscv_spill_key[2]{};
+__attribute__((visibility("hidden"))) uintptr_t* yuki_riscv_spill_pins = nullptr;
+__attribute__((visibility("hidden"))) uintptr_t yuki_riscv_spill_pin_chunks[kPinDirectoryWords]{};
+// Indexed by kernel TID. A borrower publishes its TP before claiming a file.
+// The low bit tags an exit watch, which a new enrollment replaces with its TP.
+__attribute__((visibility("hidden"))) uintptr_t* yuki_riscv_spill_threads = nullptr;
+}
+static_assert(YUKI_RVV_PIN_GROUP == sizeof(uintptr_t));  // assembly indexes words by aligned TID
+static pthread_key_t spill_exit_key;
+static bool spill_exit_key_valid;
+static bool spill_reservation_committed;
+
+template <class Bank>
+static size_t spill_bank_bytes(size_t file_bytes) {
+  return sizeof(Bank) + sizeof(Bank::owners) / sizeof(uintptr_t) * file_bytes;
+}
+
+static size_t mapped_spill_bytes(size_t bytes) {
+  const size_t page = system_page_size();
+  return (bytes + page - 1) & ~(page - 1);
+}
+
+static size_t spill_reservation_bytes() {
+  return yuki_riscv_spill_end - reinterpret_cast<uintptr_t>(yuki_riscv_spill_banks);
+}
+
+static bool reserve_spill_banks(size_t file_bytes) {
+  const size_t stride = mapped_spill_bytes(spill_bank_bytes<RiscvSpillBank>(file_bytes));
+  constexpr size_t tids = size_t{1} << YUKI_RISCV_TID_BITS;
+  // Reserve ordinary capacity for every possible Linux task. RLIMIT_NPROC can fall
+  // below the live thread count or rise after binding, and privileged callers are exempt.
+  size_t banks = (tids + YUKI_RVV_SLOTS - 1) / YUKI_RVV_SLOTS;
+  const int saved_errno = errno;
+  size_t bytes;
+  void* memory;
+  for (;;) {
+    bytes = banks * stride;
+    memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (memory != MAP_FAILED) break;
+    if (banks == 1 || errno != ENOMEM) return false;
+    // Smaller address spaces and finite RLIMIT_AS can limit the available capacity.
+    banks = std::max<size_t>(1, banks / 4);
+  }
+  errno = saved_errno;
+  auto* first = new (memory) RiscvSpillBank{};
+  first->file_bytes = file_bytes;
+  yuki_riscv_spill_stride = stride;
+  yuki_riscv_spill_end = reinterpret_cast<uintptr_t>(memory) + bytes;
+  __atomic_store_n(&yuki_riscv_spill_banks, first, __ATOMIC_RELEASE);
+  return true;
+}
+
+static bool release_spill_reservation() {
+  if (!yuki_riscv_spill_banks) return true;
+  if (munmap(yuki_riscv_spill_banks, spill_reservation_bytes()) != 0) {
+    report_cleanup_failure();
+    record_event(nullptr, YUKILINKER_C_EVENT_CLEANUP_FAILURE, YUKILINKER_C_IO_ERROR);
+    return false;
+  }
+  yuki_riscv_spill_banks = nullptr;
+  yuki_riscv_spill_end = 0;
+  yuki_riscv_spill_stride = 0;
+  return true;
+}
+
+static RiscvThreadSpills* allocate_thread_spills(size_t file_bytes) {
+  const auto bytes = spill_bank_bytes<RiscvThreadSpills>(file_bytes);
+  void* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (memory == MAP_FAILED) return nullptr;
+  auto* bank = new (memory) RiscvThreadSpills{};
+  bank->file_bytes = file_bytes;
+  return bank;
+}
+
+static bool release_thread_spills(RiscvThreadSpills*& head) {
+  while (auto* bank = head) {
+    auto* next = bank->next;
+    const size_t bytes = spill_bank_bytes<RiscvThreadSpills>(bank->file_bytes);
+    if (munmap(bank, bytes) != 0) {
+      report_cleanup_failure();
+      record_event(nullptr, YUKILINKER_C_EVENT_CLEANUP_FAILURE, YUKILINKER_C_IO_ERROR);
+      return false;
+    }
+    head = next;
+  }
+  return true;
+}
+
+namespace {
+struct SpillExitWatch {
+  SpillExitWatch* next;
+  uintptr_t thread;
+  pid_t tid;
+  int fd;
+};
+SpillExitWatch* spill_exit_watches;
+
+uintptr_t watch_tag(const SpillExitWatch* watch) {
+  return reinterpret_cast<uintptr_t>(watch) | 1;
+}
+
+uintptr_t spill_thread_pointer(uintptr_t value) {
+  return (value & 1) ? reinterpret_cast<const SpillExitWatch*>(value & ~uintptr_t{1})->thread
+                     : (value & ~uintptr_t{2});
+}
+
+void reap_spill_exit_watches(bool discard = false) {
+  auto** link = &spill_exit_watches;
+  while (auto* watch = *link) {
+    const auto tid = static_cast<unsigned>(watch->tid);
+    auto* group = &yuki_riscv_spill_pins[tid / YUKI_RVV_PIN_GROUP];
+    auto* thread = &yuki_riscv_spill_threads[tid];
+    // The group is read first. A new borrower publishes its TP before advancing that epoch.
+    auto word = __atomic_load_n(group, __ATOMIC_ACQUIRE);
+    auto tag = watch_tag(watch);
+    if (__atomic_load_n(thread, __ATOMIC_ACQUIRE) == tag) {
+      const auto bit = uintptr_t{1} << (tid % YUKI_RVV_PIN_GROUP);
+      if (!discard && (word & bit)) {
+        pollfd event{watch->fd, POLLIN, 0};
+        if ((word | uintptr_t{YUKI_RVV_PIN_MASK}) == UINTPTR_MAX || poll(&event, 1, 0) != 1 ||
+            !(event.revents & (POLLIN | POLLHUP)) ||
+            !__atomic_compare_exchange_n(group, &word, word & ~bit, false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+          link = &watch->next;
+          continue;
+        }
+      }
+      __atomic_compare_exchange_n(thread, &tag, uintptr_t{0}, false, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE);
+    }
+    *link = watch->next;
+    close(watch->fd);
+    free_object(watch);
+  }
+}
+
+void watch_spill_thread_exit(uintptr_t thread) {
+  const pid_t tid = gettid();
+  if (tid <= 0 || static_cast<unsigned>(tid) >= (1u << YUKI_RISCV_TID_BITS)) return;
+  auto& slot = yuki_riscv_spill_threads[tid];
+  // Synthetic/manual key values do not represent a borrower, and a repeated callback can
+  // keep an existing watch so long as no descriptor has enrolled again.
+  if (__atomic_load_n(&slot, __ATOMIC_ACQUIRE) != thread) return;
+  const int fd = pidfd_open(tid, PIDFD_THREAD);
+  auto* watch = fd != -1 ? allocate_object<SpillExitWatch>() : nullptr;
+  if (!watch) {
+    if (fd != -1) close(fd);
+    // Tag an exited thread without a pidfd so a reusing thread knows it does not hold the pin.
+    __atomic_store_n(&slot, thread | uintptr_t{2}, __ATOMIC_RELEASE);
+    return;
+  }
+  *watch = {spill_exit_watches, thread, tid, fd};
+  spill_exit_watches = watch;
+  __atomic_store_n(&slot, watch_tag(watch), __ATOMIC_RELEASE);
+}
+
+template <class Bank>
+void clear_spill_owners(Bank* bank, uintptr_t thread, bool vanished) {
+  for (; bank; bank = __atomic_load_n(&bank->next, __ATOMIC_ACQUIRE)) {
+    for (size_t i = 0; i < sizeof(bank->owners) / sizeof(uintptr_t); ++i) {
+      const auto owner = __atomic_load_n(&bank->owners[i], __ATOMIC_RELAXED);
+      if (!owner) continue;
+      const bool mine = (owner & ~uintptr_t{1}) == thread;
+      if (vanished && mine && owner != thread)
+        __atomic_store_n(&bank->owners[i], thread, __ATOMIC_RELEASE);
+      if (mine == vanished) continue;
+      __atomic_store_n(&bank->frames[i], uintptr_t{0}, __ATOMIC_RELAXED);
+      __atomic_store_n(&bank->owners[i], uintptr_t{0}, __ATOMIC_RELEASE);
+    }
+  }
+}
+
+void abandoned_spills(void*) {
+  OperationGuard operation;
+  ScopedSignalBlocker signals;
+  const int saved_errno = errno;
+  const auto self = current_thread_pointer();
+  clear_spill_owners(yuki_riscv_spill_banks, self, false);
+  clear_spill_owners(yuki_riscv_thread_spills, self, false);
+  // Keep the TID pinned through Bionic's return from this callback. Shutdown
+  // can reap it once the kernel confirms that this generation has exited.
+  reap_spill_exit_watches();
+  watch_spill_thread_exit(self);
+  errno = saved_errno;
+}
+
+// Compare through the kernel before trusting Bionic's candidate key-data pointer.
+// A zero-length requeue compares the word without modifying it or waiting on it.
+bool probe_key_word(uintptr_t address, uint32_t expected, bool require_match) {
+  uint32_t other = 0;
+  const long result =
+      syscall(SYS_futex, address, FUTEX_CMP_REQUEUE_PRIVATE, 0, 0, &other, expected);
+  return result == 0 || (!require_match && result == -1 && errno == EAGAIN);
+}
+
+bool prepare_spill_key() {
+  if (spill_exit_key_valid) return true;
+  const int err = pthread_key_create(&spill_exit_key, abandoned_spills);
+  if (err) return fail_errno(YUKILINKER_C_RELOCATIONS, err);
+  const auto tp = current_thread_pointer();
+  const int saved_probe_errno = errno;
+  uintptr_t thread = 0, keys = 0;
+  bool compatible =
+      tp % alignof(uintptr_t) == 0 &&
+      probe_key_word(tp + YUKI_BIONIC_PTHREAD_FROM_TP, 0, false) &&
+      probe_key_word(tp + YUKI_BIONIC_PTHREAD_FROM_TP + 4, 0, false) &&
+      probe_key_word(tp + YUKI_BIONIC_KEY_DATA_FROM_TP, 0, false) &&
+      probe_key_word(tp + YUKI_BIONIC_KEY_DATA_FROM_TP + 4, 0, false);
+  errno = saved_probe_errno;
+  if (compatible) {
+    memcpy(&thread, reinterpret_cast<void*>(tp + YUKI_BIONIC_PTHREAD_FROM_TP), sizeof(thread));
+    memcpy(&keys, reinterpret_cast<void*>(tp + YUKI_BIONIC_KEY_DATA_FROM_TP), sizeof(keys));
+  }
+  const unsigned index = static_cast<unsigned>(spill_exit_key) ^ (1u << 31);
+  uintptr_t cookie;
+  compatible = compatible && thread && thread % alignof(uintptr_t) == 0 &&
+               thread == static_cast<uintptr_t>(pthread_self()) && keys && index < 256 &&
+               thread <= UINTPTR_MAX - YUKI_BIONIC_TID_FROM_PTHREAD - sizeof(pid_t);
+  if (compatible) {
+    const int saved_tid_errno = errno;
+    compatible = probe_key_word(thread + YUKI_BIONIC_TID_FROM_PTHREAD, 0, false);
+    errno = saved_tid_errno;
+  }
+  if (compatible) {
+    pid_t tid;
+    memcpy(&tid, reinterpret_cast<void*>(thread + YUKI_BIONIC_TID_FROM_PTHREAD), sizeof(tid));
+    // The relocation owns the operation mutex, even if its pthread depth-key store failed.
+    compatible = tid > 0 && tid == gettid() &&
+                 __atomic_load_n(yuki_riscv_operation_owner_tid, __ATOMIC_RELAXED) == tid &&
+                 pthread_setspecific(spill_exit_key, &cookie) == 0;
+  }
+  if (compatible) {
+    const size_t offset = index * 2 * sizeof(uintptr_t);
+    const uintptr_t entry = keys + offset;
+    const uintptr_t marker = reinterpret_cast<uintptr_t>(&cookie);
+    const int saved = errno;
+    compatible = keys <= UINTPTR_MAX - offset - 15 && entry % alignof(uintptr_t) == 0 &&
+                 probe_key_word(entry + 8, static_cast<uint32_t>(marker), true) &&
+                 probe_key_word(entry + 12, static_cast<uint32_t>(marker >> 32), true);
+    // Observe a second public write to the same cell before reading its adjacent sequence.
+    const uintptr_t second = reinterpret_cast<uintptr_t>(&spill_exit_key);
+    compatible = compatible && pthread_setspecific(spill_exit_key, &spill_exit_key) == 0 &&
+                 probe_key_word(entry + 8, static_cast<uint32_t>(second), true) &&
+                 probe_key_word(entry + 12, static_cast<uint32_t>(second >> 32), true) &&
+                 probe_key_word(entry, 0, false) && probe_key_word(entry + 4, 0, false);
+    if (compatible) {
+      uintptr_t sequence;
+      memcpy(&sequence, reinterpret_cast<void*>(entry), sizeof(sequence));
+      compatible = (sequence & 1) != 0;
+      if (compatible) {
+        yuki_riscv_spill_key[0] = offset;
+        yuki_riscv_spill_key[1] = sequence;
+      }
+    }
+    compatible = pthread_setspecific(spill_exit_key, nullptr) == 0 && compatible;
+    errno = saved;
+  }
+  if (!compatible) {
+    pthread_key_delete(spill_exit_key);
+    return fail(YUKILINKER_C_UNSUPPORTED, YUKILINKER_C_RELOCATIONS);
+  }
+  // Only a Core which binds a wide descriptor needs lifetime pins.
+  // The TID arrays are demand-zero. Only pages reached by this Core's borrowers are written.
+  constexpr size_t tids = 1u << YUKI_RISCV_TID_BITS;
+  auto* pins = static_cast<uintptr_t*>(calloc(kSpillPinWords + tids, sizeof(uintptr_t)));
+  if (!pins) {
+    pthread_key_delete(spill_exit_key);
+    return fail_errno(YUKILINKER_C_RELOCATIONS, ENOMEM);
+  }
+  yuki_riscv_spill_pins = pins;
+  yuki_riscv_spill_threads = pins + kSpillPinWords;
+  spill_exit_key_valid = true;
+  return true;
+}
+
+void release_spill_key() {
+  if (!spill_exit_key_valid) return;
+  pthread_key_delete(spill_exit_key);
+  spill_exit_key_valid = false;
+  reap_spill_exit_watches(true);
+  free(yuki_riscv_spill_pins);
+  yuki_riscv_spill_pins = nullptr;
+  yuki_riscv_spill_threads = nullptr;
+  memset(yuki_riscv_spill_pin_chunks, 0, sizeof(yuki_riscv_spill_pin_chunks));
+}
+
+bool fail_initial_spill_mapping(int error) {
+  // No wide descriptor has been published. Detach the provisional thread tags before
+  // unmapping their storage. A failed unmap stays on the list for accounting and retry.
+  fail_errno(YUKILINKER_C_RELOCATIONS, error);
+  for (auto* thread = g_thread_states; thread; thread = thread->next)
+    release_thread_spill_tag(thread);
+  (void)release_thread_spills(yuki_riscv_thread_spills);
+  release_spill_key();
+  return false;
+}
+
+// The operation lock serializes assignments. The tag grants access to scratch space only.
+// The TLS lookup still reads the calling thread's pthread key and verifies the generation.
+bool reserve_thread_spill(ThreadTlsState* thread, size_t file_bytes) {
+  if (!file_bytes) {
+    if (!yuki_riscv_spill_banks) return true;
+    file_bytes = yuki_riscv_spill_banks->file_bytes;
+  }
+  auto** link = &yuki_riscv_thread_spills;
+  for (;;) {
+    auto* bank = *link;
+    if (!bank) {
+      bank = allocate_thread_spills(file_bytes);
+      if (!bank) return false;
+      __atomic_store_n(link, bank, __ATOMIC_RELEASE);
+    }
+    // The native TLS key can release the tag before the spill key reclaims frames
+    // abandoned by pthread_exit. Let that destructor finish before reassigning the bank.
+    if (!__atomic_load_n(&bank->thread, __ATOMIC_ACQUIRE) &&
+        std::none_of(std::begin(bank->owners), std::end(bank->owners), [](const auto& owner) {
+          return __atomic_load_n(&owner, __ATOMIC_ACQUIRE) != 0;
+        })) {
+      thread->spill_tag = &bank->thread;
+      __atomic_store_n(&bank->thread, thread->thread_pointer, __ATOMIC_RELEASE);
+      return true;
+    }
+    link = &bank->next;
+  }
+}
+}  // namespace
+
+bool prepare_riscv_tlsdesc_spills(ImageState* image) {
+  if (image->uses_riscv_tlsdesc_spills) return true;
+  size_t vlenb;
+  asm("csrr %0, vlenb" : "=r"(vlenb));
+  if (vlenb <= YUKI_RVV_INLINE_VLENB) return true;
+  // The relocation owns the operation lock. Publish the first mapping before a signal can fork.
+  ScopedSignalBlocker signals;
+  if (!yuki_riscv_spill_banks) {
+    if (!prepare_spill_key()) return false;
+    // Traditional TLS and symbol lookups can warm a thread before the first TLSDESC is loaded.
+    for (auto* thread = g_thread_states; thread; thread = thread->next)
+      if (thread->first && !thread->spill_tag && !reserve_thread_spill(thread, 32 * vlenb))
+        return fail_initial_spill_mapping(errno);
+    if (!reserve_spill_banks(32 * vlenb)) return fail_initial_spill_mapping(errno);
+  }
+  image->uses_riscv_tlsdesc_spills = true;
+  return true;
+}
+
+void commit_riscv_tlsdesc_spills(uint64_t first_generation) {
+  if (spill_reservation_committed || !yuki_riscv_spill_banks) return;
+  for (const auto* image = g_first_image; image; image = image->next) {
+    if (image->load_root->generation != first_generation || !image->uses_riscv_tlsdesc_spills)
+      continue;
+    spill_reservation_committed = true;
+    return;
+  }
+}
+
+bool rollback_riscv_tlsdesc_spills() {
+  if (spill_reservation_committed || (!yuki_riscv_spill_banks && !yuki_riscv_thread_spills))
+    return true;
+  ScopedSignalBlocker signals;
+  if (spill_reservation_committed) return true;
+  // A relocation pass may have dropped the operation lock. Another open can still own a
+  // descriptor, and failed execution can leave a live image in the registry.
+  for (const auto* image = g_first_image; image; image = image->next)
+    if (image->uses_riscv_tlsdesc_spills) return true;
+  if (riscv_tlsdesc_spills_busy()) return true;
+  const int saved_errno = errno;
+  const int key_error = spill_exit_key_valid ? pthread_setspecific(spill_exit_key, nullptr) : 0;
+  if (key_error != 0) {
+    errno = key_error;
+    report_cleanup_failure();
+    record_event(nullptr, YUKILINKER_C_EVENT_CLEANUP_FAILURE, YUKILINKER_C_IO_ERROR);
+    errno = saved_errno;
+    return false;
+  }
+  // Keep all thread reserves usable if the shared mapping could not be returned. Once it
+  // is gone, a failed thread unmap leaves only an untagged mapping for cleanup or reuse.
+  bool released = release_spill_reservation();
+  if (released) {
+    for (auto* thread = g_thread_states; thread; thread = thread->next)
+      release_thread_spill_tag(thread);
+    released = release_thread_spills(yuki_riscv_thread_spills);
+    release_spill_key();
+  }
+  errno = saved_errno;
+  return released;
+}
+
+void prepare_riscv_tlsdesc_spills_for_fork() {
+  if (spill_exit_watches) {
+    ScopedSignalBlocker signals;
+    const int saved_errno = errno;
+    reap_spill_exit_watches();
+    errno = saved_errno;
+  }
+  // Keep descriptor calls by the forker independent of peer borrows, including
+  // child handlers that run before Core can discard the vanished peers' slots.
+  __atomic_store_n(&yuki_riscv_spill_fork_thread, current_thread_pointer(), __ATOMIC_SEQ_CST);
+}
+
+// Only a previously enrolled thread can leave a pin in a chunk. Enrollment
+// publishes the directory bit before claiming a slot. A full Core shutdown
+// is the only point at which a directory bit can be forgotten.
+template <class Visit>
+static bool visit_spill_pin_chunks(Visit visit) {
+  for (size_t i = 0; i < kPinDirectoryWords; ++i) {
+    auto bits = __atomic_load_n(&yuki_riscv_spill_pin_chunks[i], __ATOMIC_ACQUIRE);
+    while (bits) {
+      const size_t begin = (i * 64 + __builtin_ctzl(bits)) * kPinChunkWords;
+      if (visit(begin, begin + kPinChunkWords)) return true;
+      bits &= bits - 1;
+    }
+  }
+  return false;
+}
+
+void unlock_riscv_tlsdesc_spills_after_fork(bool child, pid_t parent_tid) {
+  ScopedSignalBlocker signals;
+  if (child) {
+    const int saved_errno = errno;
+    const auto survivor = current_thread_pointer();
+    clear_spill_owners(yuki_riscv_spill_banks, survivor, true);
+    clear_spill_owners(yuki_riscv_thread_spills, survivor, true);
+    // The survivor keeps its thread pointer and receives a new kernel TID.
+    // Earlier child handlers may already have pinned the new TID as well.
+    if (spill_exit_key_valid) {
+      const unsigned old_tid = static_cast<unsigned>(parent_tid);
+      const unsigned tid = static_cast<unsigned>(gettid());
+      constexpr unsigned tid_limit = 1u << YUKI_RISCV_TID_BITS;
+      const auto mask = uintptr_t{1} << (tid % YUKI_RVV_PIN_GROUP);
+      const auto has_pin = [survivor, tid_limit](unsigned id) {
+        if (id >= tid_limit) return false;
+        const auto chunk = id / kTidsPerPinChunk;
+        return (yuki_riscv_spill_pin_chunks[chunk / 64] & (uintptr_t{1} << (chunk % 64))) &&
+               (yuki_riscv_spill_pins[id / YUKI_RVV_PIN_GROUP] &
+                (uintptr_t{1} << (id % YUKI_RVV_PIN_GROUP))) &&
+               spill_thread_pointer(yuki_riscv_spill_threads[id]) == survivor;
+      };
+      const bool pinned = tid < tid_limit && (has_pin(old_tid) || has_pin(tid));
+      if (pinned) {
+        yuki_riscv_spill_threads[tid] = survivor;
+        const auto chunk = tid / kTidsPerPinChunk;
+        yuki_riscv_spill_pin_chunks[chunk / 64] |= uintptr_t{1} << (chunk % 64);
+      }
+      visit_spill_pin_chunks([&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+          const uintptr_t current = yuki_riscv_spill_pins[i];
+          uintptr_t keep = (current & ~uintptr_t{YUKI_RVV_PIN_MASK}) |
+                           (pinned && i == tid / YUKI_RVV_PIN_GROUP ? mask : 0);
+          if (current != keep) {
+            if ((keep | uintptr_t{YUKI_RVV_PIN_MASK}) != UINTPTR_MAX)
+              keep += YUKI_RVV_PIN_EPOCH;
+            __atomic_store_n(&yuki_riscv_spill_pins[i], keep, __ATOMIC_RELEASE);
+          }
+        }
+        return false;
+      });
+      reap_spill_exit_watches(true);
+    }
+    errno = saved_errno;
+  }
+  __atomic_store_n(&yuki_riscv_spill_fork_thread, uintptr_t{0}, __ATOMIC_RELEASE);
+}
+
+static size_t thread_spill_bytes() {
+  size_t sum = 0;
+  for (auto* bank = yuki_riscv_thread_spills; bank; bank = bank->next)
+    sum += mapped_spill_bytes(spill_bank_bytes<RiscvThreadSpills>(bank->file_bytes));
+  return sum;
+}
+
+// A nonzero TP asks about a particular owner, including the caller. Zero asks about peers.
+// Only erase an exited TID if the whole word still has the enrollment epoch we probed.
+static bool spill_pin_live(uintptr_t owner, pid_t self, pid_t pid) {
+  return visit_spill_pin_chunks([&](size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i) {
+      auto* group = &yuki_riscv_spill_pins[i];
+      auto word = __atomic_load_n(group, __ATOMIC_ACQUIRE);
+      auto bits = word & YUKI_RVV_PIN_MASK;
+      unsigned retries = 0;
+      while (bits) {
+        const auto bit = bits & -bits;
+        const auto tid = static_cast<pid_t>(YUKI_RVV_PIN_GROUP * i + __builtin_ctzl(bit));
+        bits &= ~bit;
+        if (owner ? spill_thread_pointer(__atomic_load_n(&yuki_riscv_spill_threads[tid],
+                                                        __ATOMIC_ACQUIRE)) != owner
+                  : tid == self)
+          continue;
+        if (tid == self || syscall(SYS_tgkill, pid, tid, 0) != -1 || errno != ESRCH) return true;
+        if ((word | uintptr_t{YUKI_RVV_PIN_MASK}) != UINTPTR_MAX) {
+          const auto remaining = word & ~bit;
+          if (__atomic_compare_exchange_n(group, &word, remaining, false, __ATOMIC_ACQ_REL,
+                                          __ATOMIC_ACQUIRE)) {
+            word = remaining;
+          } else {
+            if (++retries == 8) return true;
+            bits = word & YUKI_RVV_PIN_MASK;
+          }
+        }
+      }
+    }
+    return false;
+  });
+}
+
+// A later application key can abandon a file after Bionic's final visit to our key.
+// Tag the owner before rechecking: a thread reusing its TP must publish its own pin
+// and claim an untagged slot. Only the operation-lock holder can install this tag.
+static void reap_spill_owner(uintptr_t* slot, uintptr_t* frame, pid_t self, pid_t pid) {
+  auto value = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  const auto owner = value & ~uintptr_t{1};
+  if (!owner) return;
+  if (value != UINTPTR_MAX) {
+    auto marked = owner | 1;
+    if (value == owner && (spill_pin_live(owner, self, pid) ||
+                           !__atomic_compare_exchange_n(slot, &value, marked, false,
+                                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)))
+      return;
+    if (spill_pin_live(owner, self, pid)) {
+      __atomic_compare_exchange_n(slot, &marked, owner, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+      return;
+    }
+    // An interrupted collection can resume either the liveness check or this final release.
+    if (!__atomic_compare_exchange_n(slot, &marked, UINTPTR_MAX, false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_RELAXED))
+      return;
+  }
+  __atomic_store_n(frame, uintptr_t{0}, __ATOMIC_RELAXED);
+  __atomic_store_n(slot, uintptr_t{0}, __ATOMIC_RELEASE);
+}
+
+template <class Bank>
+static void reap_spill_list(Bank* bank, pid_t self, pid_t pid) {
+  for (; bank; bank = __atomic_load_n(&bank->next, __ATOMIC_ACQUIRE))
+    for (size_t i = 0; i < sizeof(bank->owners) / sizeof(uintptr_t); ++i)
+      reap_spill_owner(&bank->owners[i], &bank->frames[i], self, pid);
+}
+
+void reap_riscv_tlsdesc_spills() {
+  if (!spill_exit_key_valid) return;
+  ScopedSignalBlocker signals;
+  const int saved = errno;
+  const pid_t self = gettid(), pid = getpid();
+  reap_spill_exit_watches();
+  reap_spill_list(yuki_riscv_spill_banks, self, pid);
+  reap_spill_list(yuki_riscv_thread_spills, self, pid);
+  errno = saved;
+}
+
+size_t riscv_tlsdesc_mapped_bytes() {
+  reap_riscv_tlsdesc_spills();
+  return spill_reservation_bytes() + thread_spill_bytes();
+}
+
+bool riscv_tlsdesc_spills_busy() {
+  if (!spill_exit_key_valid) return false;
+  reap_riscv_tlsdesc_spills();
+  const int saved = errno;
+  const bool active = spill_pin_live(0, gettid(), getpid());
+  errno = saved;
+  return active;
+}
+
+bool release_riscv_tlsdesc_spills() {
+  // Fork recovery traverses both lists even after the last image has been retired.
+  ScopedSignalBlocker signals;
+  if (riscv_tlsdesc_spills_busy()) return false;
+  const int key_error = spill_exit_key_valid ? pthread_setspecific(spill_exit_key, nullptr) : 0;
+  if (key_error != 0) {
+    errno = key_error;
+    report_cleanup_failure();
+    record_event(nullptr, YUKILINKER_C_EVENT_CLEANUP_FAILURE, YUKILINKER_C_IO_ERROR);
+    return false;
+  }
+  if (!release_thread_spills(yuki_riscv_thread_spills) || !release_spill_reservation())
+    return false;
+  release_spill_key();
+  return true;
+}
+#endif
 #else
 bool activate_tls(ImageState* image) { return image->tls.memory_bytes == 0; }
 int module_thread_atexit(void (*)(void*), void*, void*) { return -1; }
 void deactivate_tls(ImageState*) {}
 void detach_image_tls_blocks(ImageState*) {}
+void* tls_block_address(uintptr_t, uintptr_t, int*) { return nullptr; }
 extern "C" void* yuki_tls_get_addr(TlsIndex*) { return nullptr; }
 void* current_thread_tls_data(uintptr_t, uintptr_t) { return nullptr; }
 #endif  // #if YUKILINKER_FULL

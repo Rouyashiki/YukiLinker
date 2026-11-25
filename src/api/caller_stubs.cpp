@@ -23,7 +23,7 @@ namespace {
 
 // Each template contains its binding-cell address and its entry address. i386 embeds
 // the two addresses as instruction immediates; the other templates use adjacent literals.
-#if defined(__aarch64__) || defined(__x86_64__)
+#if defined(__aarch64__) || defined(__x86_64__) || (defined(__riscv) && __riscv_xlen == 64)
 constexpr size_t kStubCode = 16;
 constexpr size_t kStubBytes = 32;
 constexpr size_t kGenerationAt = 16;

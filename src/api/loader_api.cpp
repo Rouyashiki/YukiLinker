@@ -451,14 +451,13 @@ LookupValue lookup_locked(void* handle, const char* name, const char* version, I
       !lookup_control_compatible(image, handle, target, name, version))
     return result;
   if (target.image && ELF64_ST_TYPE(target.symbol->st_info) == STT_TLS) {
-    TlsIndex index{target.image->tls.module_id, target.symbol->st_value};
-    result.address = yuki_tls_get_addr(&index);
+    const uintptr_t offset = target.symbol->st_value;
+    int allocation_error = ENOMEM;  // posix_memalign can fail without setting errno.
+    result.address = tls_block_address(target.image->tls.module_id, offset, &allocation_error);
     result.found = result.address != nullptr;
-    // An accessible image's template is active, so inside the segment only this thread's block
-    // can be missing: one of its allocations failed (posix_memalign leaves errno alone).
-    if (!result.found && index.offset < target.image->tls.memory_bytes) {
-      errno = ENOMEM;
-      fail(YUKILINKER_C_NO_MEMORY, YUKILINKER_C_METADATA, name, version);
+    // An accessible image's template is active. A missing in-range block failed to allocate.
+    if (!result.found && offset < target.image->tls.memory_bytes) {
+      fail_errno(YUKILINKER_C_METADATA, allocation_error, name, version);
     } else if (!result.found) {
       fail(YUKILINKER_C_INVALID_ELF, YUKILINKER_C_METADATA, name, version);
     }
@@ -580,6 +579,9 @@ bool lock_for_fork(bool handler) {
     operation_unlock();
     return false;
   }
+#if defined(__riscv) && __riscv_xlen == 64
+  prepare_riscv_tlsdesc_spills_for_fork();
+#endif
   // g_tls_mutex is not taken: every holder also holds the operation lock with signals blocked,
   // so it is free at fork, and a first TLS touch on this thread (a signal handler, a
   // pthread_atfork handler) can still make its block.
@@ -681,6 +683,9 @@ void unlock_after_fork(int child) {
   // These normal mutexes were acquired by prepare on this very thread. Bionic's
   // normal unlock does not compare the old TID. Preserve their real lifetime and
   // release order in both libc and the detector; the TLS lock was never acquired.
+#if defined(__riscv) && __riscv_xlen == 64
+  unlock_riscv_tlsdesc_spills_after_fork(child != 0, g_fork_tid);
+#endif
   pthread_mutex_unlock(&g_key_mutex);
   pthread_mutex_unlock(&g_metadata_mutex);
   pthread_mutex_unlock(&g_registry_mutex);
@@ -787,6 +792,9 @@ LoaderStats loader_query_stats_impl() {
   }
   for (auto* source = g_retained_sources; source; source = source->next)
     result.mapped_bytes += source->bytes;
+#if YUKILINKER_FULL && defined(__riscv) && __riscv_xlen == 64
+  result.mapped_bytes += riscv_tlsdesc_mapped_bytes();
+#endif
 #if defined(YUKILINKER_RUNTIME)
   // Caller stub pages stay mapped until runtime_destroy (a successful try_shutdown keeps them),
   // also those of retired images.

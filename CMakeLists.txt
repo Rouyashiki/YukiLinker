@@ -18,6 +18,9 @@ endif()
 if(YUKILINKER_BUILD_API LESS 26)
   message(FATAL_ERROR "YukiLinker requires Android API 26 or newer (target API ${YUKILINKER_BUILD_API})")
 endif()
+if(CMAKE_ANDROID_ARCH_ABI STREQUAL "riscv64" AND YUKILINKER_BUILD_API LESS 37)
+  message(FATAL_ERROR "YukiLinker riscv64 requires Android API 37 or newer (target API ${YUKILINKER_BUILD_API})")
+endif()
 if(YUKILINKER_CFI AND YUKILINKER_BUILD_API LESS 27)
   message(FATAL_ERROR "YUKILINKER_CFI requires Android API 27 for the NDK cross-DSO CFI runtime")
 endif()
@@ -41,7 +44,7 @@ endif()
 include(cmake/YukiLinkerTargets.cmake)
 
 include(GNUInstallDirs)
-# Libraries and exported targets use the same ABI key as source selection so all four
+# Libraries and exported targets use the same ABI key as source selection so all supported ABI
 # installations can share a prefix. CMake's own Android platform does not set ANDROID_ABI.
 if(NOT CMAKE_ANDROID_ARCH_ABI)
   message(FATAL_ERROR "YukiLinker install needs CMAKE_ANDROID_ARCH_ABI")

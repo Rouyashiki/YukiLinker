@@ -8,3 +8,9 @@
 #ifndef YUKILINKER_FULL
 #define YUKILINKER_FULL 1
 #endif
+
+#if defined(__riscv) && defined(__has_feature)
+#if __has_feature(hwaddress_sanitizer)
+#error "YukiLinker does not support HWAddressSanitizer on riscv64"
+#endif
+#endif

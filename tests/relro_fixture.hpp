@@ -107,7 +107,7 @@ inline void exercise_relro_layouts() {
   for (const size_t page : {4096U, 16384U}) {
     for (const auto machine : {EM_ARM, EM_386})
       exercise_relro_layout<Elf32_Ehdr, Elf32_Phdr>(page, machine);
-    for (const auto machine : {EM_AARCH64, EM_X86_64})
+    for (const auto machine : {EM_AARCH64, EM_X86_64, EM_RISCV})
       exercise_relro_layout<Elf64_Ehdr, Elf64_Phdr>(page, machine);
   }
 }

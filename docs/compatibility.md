@@ -1,10 +1,10 @@
 # Supported configurations
 
 The SDK supports ARM64, ARM32, x86 and x86_64 Android processes on API 26 and
-newer. Each build handles its native ELF class and machine. The two 32-bit ABIs
-share the v1 public record layouts, including eight-byte alignment for 64-bit
-fields. Runtime page size comes from the host. Libraries use 16 KiB maximum LOAD
-alignment.
+newer, and `riscv64` Android processes on API 37 and newer. Each build handles
+its native ELF class and machine. The two 32-bit ABIs share the v1 public
+record layouts, including eight-byte alignment for 64-bit fields. Runtime page
+size comes from the host. Libraries use 16 KiB maximum LOAD alignment.
 
 ## Backend selection
 
@@ -174,6 +174,81 @@ the remaining steps in order when its current callback returns.
 Traditional AArch64 dynamic TLS relocation numbers differ between the pinned NDK
 and some Bionic releases. PRIVATE rejects the ambiguous pair before resolvers or
 constructors run. AArch64 TLSDESC and supported ARM32 dynamic TLS are available.
+On `riscv64`, PRIVATE requires the Android LP64D calling convention. The ELF
+header must specify `EF_RISCV_FLOAT_ABI_DOUBLE` and leave `EF_RISCV_RVE`,
+`EF_RISCV_RV64ILP32`, and `EF_RISCV_RVY` clear.
+An image marked `EF_RISCV_TSO` requires the Ztso CPU mask from `riscv_hwprobe`
+to cover every CPU in `/sys/devices/system/cpu/possible`. An offline CPU, a
+CPU without Ztso, an ID outside the probe mask, or an unreadable CPU list
+causes PRIVATE to return `UNSUPPORTED` before execution.
+PRIVATE supports the default `R_RISCV_TLSDESC` and traditional dynamic TLS
+(`__tls_get_addr` with the psABI `0x800` `TLS_DTV_OFFSET`). The descriptor
+resolver preserves caller-saved GPRs, floating-point state, all 32 RVV
+registers, `vl`, `vtype`, `vcsr`, and `vstart` on both initial and repeated lookups. Clang
+in the Android NDK can keep vector registers live across TLSDESC calls. At VLEN
+up to 256 bits, the resolver uses up to 1,376 bytes of stack. At larger widths,
+it uses a 400-byte frame and borrows a separate register file from its Core when
+one is available. Trusted PRIVATE images that bind Core-backed TLSDESC entries
+remain owned by Core and cannot be transferred with `release_host`.
+The Core reuses these files across bursts of calls. Each bank reserves files for
+the forking thread, including earlier child handlers. Eight separate files serve
+nested signals on the thread holding the bank's last ordinary slot. Each thread
+with native TLS storage also has an eight-file reserve for lookups when other
+threads occupy every ordinary slot. Core reassigns the reserve after the native
+TLS tag and every outstanding file have been released. If ordinary callers are
+waiting for the Core's operation mutex, its owner can use eight files reserved
+for that owner in each bank.
+
+The first wide TLSDESC binding reserves a Core-owned, anonymous, demand-zero
+virtual address range. It requests one ordinary file per possible Linux TID.
+With 4 KiB pages, each Core requests 11.25 GiB at VLEN 512 or 22.25 GiB at VLEN
+1024. Core retries smaller ranges down to one bank if the address space cannot
+accommodate the request. The successful reservation bounds simultaneous shared
+borrows. Only touched pages acquire private backing. On slot exhaustion the
+resolver links the next bank by address within this reservation using integer
+instructions. The successor is deterministic, so another thread can link it if
+the first borrower is preempted or exits. When a caller cannot borrow a file,
+the resolver uses an additional `32 * vlenb` bytes on the current stack.
+Applications that can exhaust the reserve need this space for each such lookup,
+including on an alternate signal stack.
+
+Before binding the first wide-vector descriptor, Core verifies the Bionic
+thread ID, recursive mutex owner and pthread key layout against the running libc
+without allocating file descriptors. An incompatible layout returns
+`UNSUPPORTED` with the TLSDESC relocation's type and offset.
+Wide descriptors use a 32 MiB thread-pointer index alongside the 4 MiB pin
+table. Each borrower writes the entry for its kernel TID.
+The resolver arms a thread-exit key before borrowing a file. After a
+`siglongjmp` during vector save or restore, another lookup at the same frame
+address can reclaim its file. Files abandoned at other depths can remain
+until thread exit, including when a signal handler jumps over an inner lookup
+and returns to the outer resolver. Thread exit releases the remaining files.
+If an application abandons a lookup in the final pthread destructor pass,
+module collection or a stats query reclaims its files after the kernel confirms
+exit, even if the thread never acquired a native TLS block.
+The application's pthread cleanup chain survives the jump. A live peer with
+an abandoned lookup keeps the Core available through its thread-exit callback.
+When that callback can obtain a thread pidfd, Core verifies the original
+thread's exit even if its kernel TID is reused. A later descriptor enrollment
+can replace this watch. If the callback is missed or a thread pidfd is
+unavailable, Core retains the pin until it can confirm exit by TID; a reused
+TID in the same process can delay that confirmation.
+After a fork, the child keeps the surviving thread's borrows and scans only
+the pin-table chunks reached by borrowers. It inherits the Core's reservation,
+and only banks reached by a borrower need inspection. Growth uses that same
+reservation in each process and can proceed with the fd table full. The runtime's
+`mapped_bytes` includes the reservation and per-thread mappings until each unmap
+succeeds. If the first save area cannot be mapped,
+loading reports the mapping's errno and the TLSDESC relocation's type and offset.
+If the first pool setup fails, Core releases the provisional pthread key,
+TID tables and thread reserves. Existing native TLS blocks remain usable.
+Core also discards a provisional pool if the first load fails after setup and
+no image or live borrower still needs it. Failed unmaps remain accounted for
+and can be retried.
+If a direct TLS symbol lookup cannot map its thread's reserve, the lookup
+reports the mapping's errno at the metadata stage and identifies the requested symbol.
+The Core passes `(AT_HWCAP, __riscv_hwprobe, nullptr)` to IFUNC resolvers and
+rejects non-zero `GNU_PROPERTY_RISCV_FEATURE_1_AND` bits before execution.
 On x86 and x86_64, PRIVATE handles traditional dynamic TLS. The i386 accessor
 is `___tls_get_addr` with a register argument and the x86_64 accessor is
 `__tls_get_addr`. PRIVATE refuses x86 TLS descriptors and initial-exec references
@@ -226,6 +301,33 @@ test and the C and C++ hosts built with cross-DSO CFI.
 API 31 Bionic under QEMU user mode also covered repeated bootstrap handoffs,
 concurrent PRIVATE and SYSTEM loading in one runtime, and the CFI configuration
 on both x86 ABIs. ARM regression runs used a dual-ABI AOSP API 34 Bionic build
-under QEMU. Record the image, emulator version, linker and library hashes when
-reproducing results. Device policy, Java VM lifecycle and application integration
-require verification in the consuming application's environment.
+under QEMU.
+
+The initial `riscv64` implementation ran on Android 17 (`riscv64`, API 37) in the
+AOSP Cuttlefish emulator (`16968706`,
+`generic/aosp_cf_riscv64_phone/vsoc_riscv64:17/CP2A.260605.016/16968706:userdebug/test-keys`,
+Linux `6.19.0-mainline-g365b87b792fe-ab15017353`, 4096-byte page size, SELinux `Enforcing`,
+`uid=2000(shell)` with zero capabilities) under bundled QEMU (`-cpu rva23s64`). The Cuttlefish
+run verified `c_host`, `cpp_host`, `bootstrap_host`, all five C/C++ archive, source and `noexcept`
+`--system` consumer Cores, and the cross-DSO CFI `c_host`, `cpp_host` and `--system` consumer
+Core, including RVV/FP/GPR-preserving `TLSDESC`, `__riscv_hwprobe` IFUNC, `IRELATIVE`, `trad`
+TLS, `caller_stub`, `call_barrier`, `GNU_PROPERTY_RISCV_FEATURE_1_AND` rejection and
+`libemutls_runtime.so` support. Under the same Cuttlefish guest, all 45 project-built `riscv64`
+shared objects link with `PT_LOAD` alignment `0x4000`, and re-running the entire 11-target host,
+consumer and CFI suite with `yukilinker_c_host_services.page_size = 16384` passed (`EXIT=0`),
+verifying 16 KiB `load_bias` alignment, `host_services_bind` validation, 4 KiB-aligned ELF
+rejection, 16 KiB `RELRO` mapping/sharing and `android_dlopen_ext` `LIBRARY_FD_OFFSET` and
+`RESERVED_ADDRESS` enforcement on top of the 4 KiB kernel.
+
+The anonymous spill reservation was tested on the same Cuttlefish image with
+VLEN 1024. All 11 Native host, SDK consumer and cross-DSO CFI cases passed with
+both the default and 16 KiB loader page sizes on the 4 KiB kernel. Wide TLS
+coverage included growth with a full fd table, fork with an active borrow in
+the second bank, nested signals, thread exit and shutdown retry. QEMU user-mode
+TLS tests covered VLEN 128, 256, 512 and 1024 at both loader page sizes.
+
+Physical `riscv64` hardware and a native 16 KiB-kernel / `AT_PAGESZ=16384`
+`riscv64` Android guest remain unverified. Record the image, emulator version,
+linker and library hashes when reproducing results. Device policy, Java VM
+lifecycle and application integration require verification in the consuming
+application's environment.

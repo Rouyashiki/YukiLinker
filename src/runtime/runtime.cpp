@@ -927,6 +927,9 @@ SoHandle* dlopen_memfd_offset(int memfd, const char* name, bool file_backed, uin
     }
     if (initialized) {
       apply_dependency_flags(first_generation);
+#if YUKILINKER_FULL && defined(__riscv) && __riscv_xlen == 64
+      commit_riscv_tlsdesc_spills(first_generation);
+#endif
       // The handle goes back now, without the lock dropping again: its reference is the caller's.
       --root->pending_references;
       return handle;
@@ -989,6 +992,9 @@ SoHandle* dlopen_memfd_offset(int memfd, const char* name, bool file_backed, uin
   // A page size that only this open's images committed goes with them: every image kept (FAILED,
   // or a dead copy whose munmap failed) is still registered and keeps it.
   release_image_page_size(g_first_image != nullptr);
+#if YUKILINKER_FULL && defined(__riscv) && __riscv_xlen == 64
+  (void)rollback_riscv_tlsdesc_spills();
+#endif
   return nullptr;
 }
 
@@ -1000,8 +1006,7 @@ void* dlsym(SoHandle* handle, const char* name) {
 #if YUKILINKER_FULL
   if (ELF64_ST_TYPE(symbol->st_info) == STT_TLS) {
     if (!image->tls.active) return nullptr;
-    TlsIndex index{image->tls.module_id, symbol->st_value};
-    return yuki_tls_get_addr(&index);
+    return tls_block_address(image->tls.module_id, symbol->st_value);
   }
 #endif  // #if YUKILINKER_FULL
   SymbolResolution resolution = materialize_defined_symbol(image, *symbol);
@@ -1416,6 +1421,10 @@ bool collect_images_internal() {
     }
   } collecting;
 #if YUKILINKER_FULL
+#if defined(__riscv) && __riscv_xlen == 64
+  // A borrower can exit during its first vector save, before it owns a native TLS block.
+  reap_riscv_tlsdesc_spills();
+#endif
   bool may_reap_threads = private_key_threads_active() || g_thread_states;
 #else
   bool may_reap_threads = false;
@@ -1430,6 +1439,9 @@ bool collect_images_internal() {
     ++g_collection_pass;
     unmapped &= collect_pass(first_new, &complete, may_reap_threads);
   } while (g_collect_again);
+#if YUKILINKER_FULL && defined(__riscv) && __riscv_xlen == 64
+  unmapped &= rollback_riscv_tlsdesc_spills();
+#endif
   return unmapped && complete;
 }
 }  // namespace
@@ -1530,6 +1542,9 @@ uint32_t retire_scope_images(Context* scope) {
 }
 
 bool other_thread_states() {
+#if defined(__riscv) && __riscv_xlen == 64
+  if (riscv_tlsdesc_spills_busy()) return true;
+#endif
   if (private_key_threads_active()) return true;
   const auto* own = g_thread_tls_key_valid
                         ? static_cast<const ThreadTlsState*>(pthread_getspecific(g_thread_tls_key))
@@ -1893,6 +1908,9 @@ bool shutdown() {
   // here leaves the runtime whole, and a later call tries again.
   if (!release_leftovers()) return false;
 #if YUKILINKER_FULL
+#if defined(__riscv) && __riscv_xlen == 64
+  if (!release_riscv_tlsdesc_spills()) return false;
+#endif
   {
     ScopedSignalBlocker signals;
     pthread_mutex_lock(&g_tls_mutex);
